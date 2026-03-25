@@ -8,9 +8,8 @@ This agent is the sole gateway to IB Gateway. It implements:
   - ORDER FILL DETECTION via execDetailsEvent (Known Gap #1 — now implemented)
   - POSITION CLOSE DETECTION via orderStatusEvent (Known Gap #2 — now implemented)
 
-IMPORTANT: ib_insync is NOT thread-safe. All IB calls must happen on the
-same event loop. We use ib_insync's native async connectAsync() and
-asyncio-compatible patterns — never run_in_executor for IB methods.
+All IB API calls use the async variants (qualifyContractsAsync, etc.)
+to avoid "event loop is already running" errors on Python 3.12+.
 """
 
 import asyncio
@@ -26,7 +25,7 @@ class IBKRClientAgent(BaseAgent):
     def __init__(self, config: dict, orchestrator=None):
         super().__init__("IBKRClientAgent", orchestrator)
         self.host = config.get("host", "127.0.0.1")
-        self.port = config.get("port", 7497)
+        self.port = config.get("port", 4002)
         self.client_id = config.get("client_id", 1)
         self.ib = IB()
         self._connected = False
@@ -34,31 +33,26 @@ class IBKRClientAgent(BaseAgent):
         self._subscriptions: dict[str, Contract] = {}
         self._market_data: dict[str, dict] = {}
         self._account_data: dict = {}
-        # Track orders placed through this agent for fill/close detection
-        self._active_orders: dict[int, dict] = {}  # orderId -> order metadata
-        self._bracket_groups: dict[int, dict] = {}  # parent orderId -> bracket info
+        self._active_orders: dict[int, dict] = {}
+        self._bracket_groups: dict[int, dict] = {}
 
     async def run(self):
         """Main loop: connect, subscribe events, poll account."""
         await self._connect()
         if self._connected:
-            # --- Known Gap #1: Wire up execution detail events for order fill detection ---
             self.ib.execDetailsEvent += self._on_exec_detail
-            # --- Known Gap #2: Wire up order status events for position close detection ---
             self.ib.orderStatusEvent += self._on_order_status
-            # Also listen for new trades to track bracket orders
             self.ib.newOrderEvent += self._on_new_order
-            # Disconnect handler
             self.ib.disconnectedEvent += self._on_disconnect
 
-            # Start account polling loop
-            asyncio.create_task(self._account_poll_loop())
+            # Request account updates to keep data fresh
+            self.ib.reqAccountUpdates()
+
+            asyncio.ensure_future(self._account_poll_loop())
 
         while self._running:
             await self._process_inbox()
-            if self._connected:
-                # Let ib_insync process pending network events without blocking
-                await asyncio.sleep(0)
+            # ib_insync processes events via the event loop automatically
             await asyncio.sleep(0.1)
 
     async def _connect(self):
@@ -66,7 +60,6 @@ class IBKRClientAgent(BaseAgent):
         for attempt, delay in enumerate(self._reconnect_delays):
             try:
                 logger.info(f"Connecting to IB Gateway at {self.host}:{self.port} (attempt {attempt + 1})")
-                # Use ib_insync's native async connect
                 await self.ib.connectAsync(self.host, self.port, clientId=self.client_id)
                 self._connected = True
                 logger.info("Connected to IB Gateway successfully")
@@ -82,7 +75,7 @@ class IBKRClientAgent(BaseAgent):
         self.broadcast("ibkr_disconnect_fatal", {"reason": "All connection attempts failed"})
 
     def _on_disconnect(self):
-        """Handle unexpected disconnection — attempt reconnect."""
+        """Handle unexpected disconnection."""
         logger.warning("IB Gateway disconnected")
         self._connected = False
         asyncio.ensure_future(self._reconnect())
@@ -106,13 +99,7 @@ class IBKRClientAgent(BaseAgent):
     # ─── Order Fill Detection (Known Gap #1) ───────────────────────────
 
     def _on_exec_detail(self, trade: Trade, fill):
-        """
-        Called by ib_insync when an execution detail arrives.
-        This fires for every fill on every order — including the parent
-        (entry) order and the child (SL/TP) orders of a bracket.
-
-        We broadcast an order_filled message so ExecutionAgent can record the trade.
-        """
+        """Called by ib_insync on execution detail — detects order fills."""
         try:
             execution = fill.execution
             contract = fill.contract
@@ -121,7 +108,7 @@ class IBKRClientAgent(BaseAgent):
             symbol = contract.symbol
             fill_price = execution.avgPrice
             quantity = int(execution.shares)
-            side = execution.side  # "BOT" (bought) or "SLD" (sold)
+            side = execution.side
             exec_time = execution.time
 
             logger.info(
@@ -129,14 +116,12 @@ class IBKRClientAgent(BaseAgent):
                 f"(orderId={order_id}, execId={execution.execId})"
             )
 
-            # Determine if this is a parent (entry) fill or a child (SL/TP) fill
             bracket_info = self._bracket_groups.get(order_id)
             is_entry = bracket_info is not None and bracket_info.get("role") == "parent"
 
-            # Check if this order is a child of a bracket group
             is_child = False
             parent_order_id = None
-            child_role = None  # "stop_loss" or "take_profit"
+            child_role = None
             for parent_id, info in self._bracket_groups.items():
                 if order_id == info.get("sl_order_id"):
                     is_child = True
@@ -150,43 +135,27 @@ class IBKRClientAgent(BaseAgent):
                     break
 
             if is_entry:
-                # Parent order filled — this is a new position entry
                 self.broadcast("order_filled", {
-                    "symbol": symbol,
-                    "fill_price": fill_price,
-                    "quantity": quantity,
-                    "side": side,
-                    "order_id": order_id,
-                    "exec_time": str(exec_time),
+                    "symbol": symbol, "fill_price": fill_price,
+                    "quantity": quantity, "side": side,
+                    "order_id": order_id, "exec_time": str(exec_time),
                     "fill_type": "entry",
                 })
             elif is_child:
-                # Child order filled — position is being closed by SL or TP
                 exit_reason = "SL" if child_role == "stop_loss" else "TP"
-                logger.info(
-                    f"POSITION CLOSE DETECTED: {symbol} closed by {exit_reason} "
-                    f"@ ${fill_price} (parent orderId={parent_order_id})"
-                )
+                logger.info(f"POSITION CLOSE DETECTED: {symbol} closed by {exit_reason} @ ${fill_price}")
                 self.broadcast("position_closed", {
-                    "symbol": symbol,
-                    "fill_price": fill_price,
-                    "quantity": quantity,
-                    "side": side,
-                    "order_id": order_id,
-                    "parent_order_id": parent_order_id,
-                    "exit_reason": exit_reason,
-                    "exec_time": str(exec_time),
+                    "symbol": symbol, "fill_price": fill_price,
+                    "quantity": quantity, "side": side,
+                    "order_id": order_id, "parent_order_id": parent_order_id,
+                    "exit_reason": exit_reason, "exec_time": str(exec_time),
                     "fill_type": "exit",
                 })
             else:
-                # Standalone order fill (e.g. manual close)
                 self.broadcast("order_filled", {
-                    "symbol": symbol,
-                    "fill_price": fill_price,
-                    "quantity": quantity,
-                    "side": side,
-                    "order_id": order_id,
-                    "exec_time": str(exec_time),
+                    "symbol": symbol, "fill_price": fill_price,
+                    "quantity": quantity, "side": side,
+                    "order_id": order_id, "exec_time": str(exec_time),
                     "fill_type": "close",
                 })
         except Exception as e:
@@ -195,28 +164,18 @@ class IBKRClientAgent(BaseAgent):
     # ─── Position Close Detection (Known Gap #2) ──────────────────────
 
     def _on_order_status(self, trade: Trade):
-        """
-        Called by ib_insync on order status changes.
-        We use this as a secondary detection mechanism for position closes.
-
-        When a bracket child order (SL or TP) transitions to 'Filled',
-        the position is closed. We also detect 'Cancelled' status on the
-        other child (IB auto-cancels the opposing child when one fills).
-        """
+        """Called by ib_insync on order status changes — secondary close detection."""
         try:
             order = trade.order
             order_status = trade.orderStatus
             order_id = order.orderId
             status = order_status.status
 
-            # Look up whether this order is part of a bracket group
             for parent_id, info in self._bracket_groups.items():
                 sl_id = info.get("sl_order_id")
                 tp_id = info.get("tp_order_id")
 
                 if order_id in (sl_id, tp_id) and status == "Cancelled":
-                    # One child was cancelled — the other child filled
-                    # (IB auto-cancels the remaining OCA child)
                     other_role = "TP" if order_id == sl_id else "SL"
                     logger.info(
                         f"Bracket child cancelled (orderId={order_id}): "
@@ -228,12 +187,10 @@ class IBKRClientAgent(BaseAgent):
                 if order_id == parent_id and status == "Filled":
                     logger.info(f"Parent order filled (orderId={order_id}) for {info.get('symbol')}")
                     break
-
         except Exception as e:
             logger.exception(f"Error in _on_order_status: {e}")
 
     def _on_new_order(self, trade: Trade):
-        """Track new orders placed through IB."""
         logger.debug(f"New order tracked: orderId={trade.order.orderId}, {trade.contract.symbol}")
 
     # ─── Account Polling ──────────────────────────────────────────────
@@ -248,11 +205,10 @@ class IBKRClientAgent(BaseAgent):
             await asyncio.sleep(10)
 
     async def _poll_account(self):
-        """Fetch account summary and open positions from IB."""
+        """Fetch account summary and open positions from IB using async methods."""
         try:
-            # ib_insync methods are synchronous but event-loop aware
-            # They must be called from the same loop, not via run_in_executor
-            account_values = self.ib.accountSummary()
+            # Use accountValues() which returns cached data from reqAccountUpdates
+            account_values = self.ib.accountValues()
 
             nav = 0.0
             buying_power = 0.0
@@ -260,15 +216,16 @@ class IBKRClientAgent(BaseAgent):
             unrealized_pnl = 0.0
 
             for av in account_values:
-                if av.tag == "NetLiquidation":
+                if av.tag == "NetLiquidationByCurrency" and av.currency == "USD":
                     nav = float(av.value)
                 elif av.tag == "BuyingPower":
                     buying_power = float(av.value)
-                elif av.tag == "RealizedPnL":
+                elif av.tag == "RealizedPnL" and av.currency == "USD":
                     realized_pnl = float(av.value)
-                elif av.tag == "UnrealizedPnL":
+                elif av.tag == "UnrealizedPnL" and av.currency == "USD":
                     unrealized_pnl = float(av.value)
 
+            # positions() returns cached data, no network call
             positions = self.ib.positions()
 
             open_positions = []
@@ -291,7 +248,6 @@ class IBKRClientAgent(BaseAgent):
             }
 
             self.broadcast("account_update", self._account_data)
-
         except Exception as e:
             logger.warning(f"Error polling account: {e}")
 
@@ -303,7 +259,8 @@ class IBKRClientAgent(BaseAgent):
             if symbol not in self._subscriptions:
                 contract = Stock(symbol, "SMART", "USD")
                 try:
-                    self.ib.qualifyContracts(contract)
+                    # Use async version to avoid event loop conflict
+                    await self.ib.qualifyContractsAsync(contract)
                     self._subscriptions[symbol] = contract
                     self.ib.reqMktData(contract)
                     logger.info(f"Subscribed to market data for {symbol}")
@@ -338,10 +295,10 @@ class IBKRClientAgent(BaseAgent):
         contract = self._subscriptions.get(symbol)
         if not contract:
             contract = Stock(symbol, "SMART", "USD")
-            self.ib.qualifyContracts(contract)
+            await self.ib.qualifyContractsAsync(contract)
 
         try:
-            bars = self.ib.reqHistoricalData(
+            bars = await self.ib.reqHistoricalDataAsync(
                 contract,
                 endDateTime="",
                 durationStr=duration,
@@ -350,7 +307,7 @@ class IBKRClientAgent(BaseAgent):
                 useRTH=True,
                 formatDate=1,
             )
-            return bars
+            return bars or []
         except Exception as e:
             logger.warning(f"Error fetching historical bars for {symbol}: {e}")
             return []
@@ -358,15 +315,9 @@ class IBKRClientAgent(BaseAgent):
     # ─── Order Placement ──────────────────────────────────────────────
 
     async def place_bracket_order(self, order_params: dict) -> dict | None:
-        """
-        Place a bracket order: entry (Limit) + SL (Stop) + TP (Limit).
-
-        order_params:
-          symbol, action (BUY/SELL), quantity,
-          entry_price, stop_loss, take_profit
-        """
+        """Place a bracket order: entry (Limit) + SL (Stop) + TP (Limit)."""
         symbol = order_params["symbol"]
-        action = order_params["action"]  # BUY or SELL
+        action = order_params["action"]
         quantity = order_params["quantity"]
         entry_price = order_params["entry_price"]
         stop_loss = order_params["stop_loss"]
@@ -375,7 +326,7 @@ class IBKRClientAgent(BaseAgent):
         contract = self._subscriptions.get(symbol)
         if not contract:
             contract = Stock(symbol, "SMART", "USD")
-            self.ib.qualifyContracts(contract)
+            await self.ib.qualifyContractsAsync(contract)
 
         try:
             bracket = self.ib.bracketOrder(
@@ -395,19 +346,14 @@ class IBKRClientAgent(BaseAgent):
 
             parent_trade, tp_trade, sl_trade = trades
 
-            # Track bracket group for fill/close detection
             parent_id = parent_trade.order.orderId
             self._bracket_groups[parent_id] = {
-                "symbol": symbol,
-                "action": action,
-                "quantity": quantity,
-                "entry_price": entry_price,
-                "stop_loss": stop_loss,
-                "take_profit": take_profit,
+                "symbol": symbol, "action": action,
+                "quantity": quantity, "entry_price": entry_price,
+                "stop_loss": stop_loss, "take_profit": take_profit,
                 "sl_order_id": sl_trade.order.orderId,
                 "tp_order_id": tp_trade.order.orderId,
-                "role": "parent",
-                "resolved": False,
+                "role": "parent", "resolved": False,
             }
 
             logger.info(
@@ -419,34 +365,27 @@ class IBKRClientAgent(BaseAgent):
                 "parent_order_id": parent_id,
                 "sl_order_id": sl_trade.order.orderId,
                 "tp_order_id": tp_trade.order.orderId,
-                "symbol": symbol,
-                "action": action,
-                "quantity": quantity,
+                "symbol": symbol, "action": action, "quantity": quantity,
             }
-
         except Exception as e:
             logger.exception(f"Error placing bracket order for {symbol}: {e}")
             return None
 
     async def close_position_market(self, symbol: str) -> bool:
-        """Close a position at market price. Reads live position sign for direction."""
+        """Close a position at market price."""
         try:
             positions = self.ib.positions()
-
             for pos in positions:
                 if pos.contract.symbol == symbol and pos.position != 0:
                     qty = abs(int(pos.position))
                     close_action = "SELL" if pos.position > 0 else "BUY"
                     contract = pos.contract
-
                     order = MarketOrder(close_action, qty)
                     self.ib.placeOrder(contract, order)
                     logger.info(f"Market close order placed for {symbol}: {close_action} x{qty}")
                     return True
-
             logger.warning(f"No open position found for {symbol}")
             return False
-
         except Exception as e:
             logger.exception(f"Error closing position for {symbol}: {e}")
             return False
@@ -476,16 +415,14 @@ class IBKRClientAgent(BaseAgent):
             symbol = payload.get("symbol")
             snapshot = self.get_snapshot(symbol)
             self.send(message.sender, "snapshot_response", {
-                "symbol": symbol,
-                "data": snapshot,
+                "symbol": symbol, "data": snapshot,
                 "request_id": payload.get("request_id"),
             })
 
         elif msg_type == "place_bracket_order":
             result = await self.place_bracket_order(payload)
             self.send(message.sender, "bracket_order_response", {
-                "result": result,
-                "original_order": payload,
+                "result": result, "original_order": payload,
             })
 
         elif msg_type == "close_position":
@@ -493,17 +430,14 @@ class IBKRClientAgent(BaseAgent):
             reason = payload.get("reason", "MANUAL")
             success = await self.close_position_market(symbol)
             self.send(message.sender, "close_position_response", {
-                "symbol": symbol,
-                "success": success,
-                "reason": reason,
+                "symbol": symbol, "success": success, "reason": reason,
             })
 
         elif msg_type == "cancel_order":
             order_id = payload.get("order_id")
             success = await self.cancel_order(order_id)
             self.send(message.sender, "cancel_order_response", {
-                "order_id": order_id,
-                "success": success,
+                "order_id": order_id, "success": success,
             })
 
         elif msg_type == "get_historical_bars":
@@ -512,10 +446,8 @@ class IBKRClientAgent(BaseAgent):
             bar_size = payload.get("bar_size", "1 min")
             bars = await self.get_historical_bars(symbol, duration, bar_size)
             self.send(message.sender, "historical_bars_response", {
-                "symbol": symbol,
-                "bars": bars,
-                "duration": duration,
-                "bar_size": bar_size,
+                "symbol": symbol, "bars": bars,
+                "duration": duration, "bar_size": bar_size,
             })
 
         elif msg_type == "subscribe_symbols":

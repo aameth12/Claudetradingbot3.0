@@ -9,14 +9,6 @@ from loguru import logger
 
 from utils.logger import setup_logger
 
-# ib_insync needs a running event loop before import on Python 3.12+
-# Patch: ensure there's always a loop available
-import ib_insync.util
-ib_insync.util.UseQT = 0  # Disable Qt integration
-# Patch asyncio to allow nested event loops (ib_insync requirement)
-import nest_asyncio
-nest_asyncio.apply()
-
 
 def load_config(path: str = "config.yaml") -> dict:
     """Load configuration from YAML file."""
@@ -51,12 +43,15 @@ def main():
     logger.info("AI Multi-Agent Day Trading Bot v2.0")
     logger.info("=" * 60)
 
-    # Import orchestrator after event loop setup
+    # Use ib_insync's util.run() which properly manages the event loop
+    # for compatibility with ib_insync's internal async/sync patterns
+    from ib_insync import util
     from orchestrator.orchestrator import Orchestrator
+
     orchestrator = Orchestrator(config)
 
     try:
-        asyncio.run(orchestrator.start())
+        util.run(orchestrator.start())
     except KeyboardInterrupt:
         logger.info("Interrupted by user")
     except Exception as e:
