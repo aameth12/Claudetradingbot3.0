@@ -7,12 +7,16 @@ This agent is the sole gateway to IB Gateway. It implements:
   - Bracket order placement (entry + SL + TP)
   - ORDER FILL DETECTION via execDetailsEvent (Known Gap #1 — now implemented)
   - POSITION CLOSE DETECTION via orderStatusEvent (Known Gap #2 — now implemented)
+
+IMPORTANT: ib_insync is NOT thread-safe. All IB calls must happen on the
+same event loop. We use ib_insync's native async connectAsync() and
+asyncio-compatible patterns — never run_in_executor for IB methods.
 """
 
 import asyncio
 from datetime import datetime
 
-from ib_insync import IB, Contract, LimitOrder, MarketOrder, Stock, StopOrder, Trade
+from ib_insync import IB, Contract, LimitOrder, MarketOrder, Stock, StopOrder, Trade, util
 from loguru import logger
 
 from agents.base_agent import BaseAgent, Message
@@ -53,7 +57,8 @@ class IBKRClientAgent(BaseAgent):
         while self._running:
             await self._process_inbox()
             if self._connected:
-                self.ib.sleep(0)  # Let ib_insync process events
+                # Let ib_insync process pending network events without blocking
+                await asyncio.sleep(0)
             await asyncio.sleep(0.1)
 
     async def _connect(self):
@@ -61,10 +66,8 @@ class IBKRClientAgent(BaseAgent):
         for attempt, delay in enumerate(self._reconnect_delays):
             try:
                 logger.info(f"Connecting to IB Gateway at {self.host}:{self.port} (attempt {attempt + 1})")
-                await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    lambda: self.ib.connect(self.host, self.port, clientId=self.client_id),
-                )
+                # Use ib_insync's native async connect
+                await self.ib.connectAsync(self.host, self.port, clientId=self.client_id)
                 self._connected = True
                 logger.info("Connected to IB Gateway successfully")
                 self.broadcast("ibkr_reconnected", {"status": "connected"})
@@ -82,17 +85,14 @@ class IBKRClientAgent(BaseAgent):
         """Handle unexpected disconnection — attempt reconnect."""
         logger.warning("IB Gateway disconnected")
         self._connected = False
-        asyncio.create_task(self._reconnect())
+        asyncio.ensure_future(self._reconnect())
 
     async def _reconnect(self):
         """Attempt reconnection with backoff."""
         for delay in self._reconnect_delays:
             await asyncio.sleep(delay)
             try:
-                await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    lambda: self.ib.connect(self.host, self.port, clientId=self.client_id),
-                )
+                await self.ib.connectAsync(self.host, self.port, clientId=self.client_id)
                 self._connected = True
                 logger.info("Reconnected to IB Gateway")
                 self.broadcast("ibkr_reconnected", {"status": "reconnected"})
@@ -222,8 +222,6 @@ class IBKRClientAgent(BaseAgent):
                         f"Bracket child cancelled (orderId={order_id}): "
                         f"position closed by {other_role} for {info.get('symbol')}"
                     )
-                    # Clean up bracket tracking after both children are resolved
-                    filled_child = tp_id if order_id == sl_id else sl_id
                     info["resolved"] = True
                     break
 
@@ -252,9 +250,9 @@ class IBKRClientAgent(BaseAgent):
     async def _poll_account(self):
         """Fetch account summary and open positions from IB."""
         try:
-            account_values = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: self.ib.accountSummary()
-            )
+            # ib_insync methods are synchronous but event-loop aware
+            # They must be called from the same loop, not via run_in_executor
+            account_values = self.ib.accountSummary()
 
             nav = 0.0
             buying_power = 0.0
@@ -271,9 +269,7 @@ class IBKRClientAgent(BaseAgent):
                 elif av.tag == "UnrealizedPnL":
                     unrealized_pnl = float(av.value)
 
-            positions = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: self.ib.positions()
-            )
+            positions = self.ib.positions()
 
             open_positions = []
             for pos in positions:
@@ -282,7 +278,7 @@ class IBKRClientAgent(BaseAgent):
                         "symbol": pos.contract.symbol,
                         "quantity": int(pos.position),
                         "avg_cost": pos.avgCost,
-                        "unrealized_pnl": 0.0,  # Will be updated via portfolio
+                        "unrealized_pnl": 0.0,
                     })
 
             self._account_data = {
@@ -307,13 +303,9 @@ class IBKRClientAgent(BaseAgent):
             if symbol not in self._subscriptions:
                 contract = Stock(symbol, "SMART", "USD")
                 try:
-                    await asyncio.get_event_loop().run_in_executor(
-                        None, lambda c=contract: self.ib.qualifyContracts(c)
-                    )
+                    self.ib.qualifyContracts(contract)
                     self._subscriptions[symbol] = contract
-                    await asyncio.get_event_loop().run_in_executor(
-                        None, lambda c=contract: self.ib.reqMktData(c)
-                    )
+                    self.ib.reqMktData(contract)
                     logger.info(f"Subscribed to market data for {symbol}")
                 except Exception as e:
                     logger.warning(f"Failed to subscribe to {symbol}: {e}")
@@ -346,22 +338,17 @@ class IBKRClientAgent(BaseAgent):
         contract = self._subscriptions.get(symbol)
         if not contract:
             contract = Stock(symbol, "SMART", "USD")
-            await asyncio.get_event_loop().run_in_executor(
-                None, lambda: self.ib.qualifyContracts(contract)
-            )
+            self.ib.qualifyContracts(contract)
 
         try:
-            bars = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: self.ib.reqHistoricalData(
-                    contract,
-                    endDateTime="",
-                    durationStr=duration,
-                    barSizeSetting=bar_size,
-                    whatToShow="TRADES",
-                    useRTH=True,
-                    formatDate=1,
-                ),
+            bars = self.ib.reqHistoricalData(
+                contract,
+                endDateTime="",
+                durationStr=duration,
+                barSizeSetting=bar_size,
+                whatToShow="TRADES",
+                useRTH=True,
+                formatDate=1,
             )
             return bars
         except Exception as e:
@@ -385,35 +372,25 @@ class IBKRClientAgent(BaseAgent):
         stop_loss = order_params["stop_loss"]
         take_profit = order_params["take_profit"]
 
-        # Determine close action (opposite of entry)
-        sl_action = "SELL" if action == "BUY" else "BUY"
-
         contract = self._subscriptions.get(symbol)
         if not contract:
             contract = Stock(symbol, "SMART", "USD")
-            await asyncio.get_event_loop().run_in_executor(
-                None, lambda: self.ib.qualifyContracts(contract)
-            )
+            self.ib.qualifyContracts(contract)
 
         try:
-            bracket = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: self.ib.bracketOrder(
-                    action=action,
-                    quantity=quantity,
-                    limitPrice=round(entry_price, 2),
-                    takeProfitPrice=round(take_profit, 2),
-                    stopLossPrice=round(stop_loss, 2),
-                ),
+            bracket = self.ib.bracketOrder(
+                action=action,
+                quantity=quantity,
+                limitPrice=round(entry_price, 2),
+                takeProfitPrice=round(take_profit, 2),
+                stopLossPrice=round(stop_loss, 2),
             )
 
             parent_order, tp_order, sl_order = bracket
 
             trades = []
             for order in [parent_order, tp_order, sl_order]:
-                trade = await asyncio.get_event_loop().run_in_executor(
-                    None, lambda o=order: self.ib.placeOrder(contract, o)
-                )
+                trade = self.ib.placeOrder(contract, order)
                 trades.append(trade)
 
             parent_trade, tp_trade, sl_trade = trades
@@ -454,21 +431,16 @@ class IBKRClientAgent(BaseAgent):
     async def close_position_market(self, symbol: str) -> bool:
         """Close a position at market price. Reads live position sign for direction."""
         try:
-            positions = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: self.ib.positions()
-            )
+            positions = self.ib.positions()
 
             for pos in positions:
                 if pos.contract.symbol == symbol and pos.position != 0:
                     qty = abs(int(pos.position))
-                    # Positive qty = long = SELL to close; Negative qty = short = BUY to close
                     close_action = "SELL" if pos.position > 0 else "BUY"
                     contract = pos.contract
 
                     order = MarketOrder(close_action, qty)
-                    trade = await asyncio.get_event_loop().run_in_executor(
-                        None, lambda: self.ib.placeOrder(contract, order)
-                    )
+                    self.ib.placeOrder(contract, order)
                     logger.info(f"Market close order placed for {symbol}: {close_action} x{qty}")
                     return True
 
@@ -482,14 +454,10 @@ class IBKRClientAgent(BaseAgent):
     async def cancel_order(self, order_id: int) -> bool:
         """Cancel an open order by ID."""
         try:
-            open_trades = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: self.ib.openTrades()
-            )
+            open_trades = self.ib.openTrades()
             for trade in open_trades:
                 if trade.order.orderId == order_id:
-                    await asyncio.get_event_loop().run_in_executor(
-                        None, lambda: self.ib.cancelOrder(trade.order)
-                    )
+                    self.ib.cancelOrder(trade.order)
                     logger.info(f"Cancelled order {order_id}")
                     return True
             logger.warning(f"Order {order_id} not found in open trades")

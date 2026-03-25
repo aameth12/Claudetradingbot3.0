@@ -11,3 +11,4 @@ aiohttp>=3.9.0
 loguru>=0.7.0
 tenacity>=8.2.0
 pandas-market-calendars>=4.4.0
+nest_asyncio>=1.5.0

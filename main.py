@@ -7,8 +7,15 @@ import yaml
 from dotenv import load_dotenv
 from loguru import logger
 
-from orchestrator.orchestrator import Orchestrator
 from utils.logger import setup_logger
+
+# ib_insync needs a running event loop before import on Python 3.12+
+# Patch: ensure there's always a loop available
+import ib_insync.util
+ib_insync.util.UseQT = 0  # Disable Qt integration
+# Patch asyncio to allow nested event loops (ib_insync requirement)
+import nest_asyncio
+nest_asyncio.apply()
 
 
 def load_config(path: str = "config.yaml") -> dict:
@@ -44,7 +51,8 @@ def main():
     logger.info("AI Multi-Agent Day Trading Bot v2.0")
     logger.info("=" * 60)
 
-    # Create and run orchestrator
+    # Import orchestrator after event loop setup
+    from orchestrator.orchestrator import Orchestrator
     orchestrator = Orchestrator(config)
 
     try:
