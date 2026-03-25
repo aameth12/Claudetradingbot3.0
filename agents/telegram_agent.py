@@ -67,6 +67,7 @@ class TelegramAgent(BaseAgent):
             "stop": self._cmd_stop,
             "resume": self._cmd_resume,
             "kill": self._cmd_kill,
+            "help": self._cmd_help,
         }
         for name, handler in commands.items():
             self.app.add_handler(CommandHandler(name, handler))
@@ -98,6 +99,7 @@ class TelegramAgent(BaseAgent):
             return
         text = (
             "<b>AI Trading Bot Commands</b>\n"
+            "/help — Detailed guide for all commands\n"
             "/status — Full live dashboard\n"
             "/positions — Open positions\n"
             "/pnl — P&L breakdown\n"
@@ -112,6 +114,117 @@ class TelegramAgent(BaseAgent):
             "/stop — Pause trading\n"
             "/resume — Resume trading\n"
             "/kill — Emergency shutdown"
+        )
+        await update.message.reply_text(text, parse_mode="HTML")
+
+    async def _cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._auth(update):
+            return
+
+        text = (
+            "<b>AI Trading Bot — Full Command Guide</b>\n"
+            "=" * 35 + "\n\n"
+
+            "<b>/start</b>\n"
+            "Shows a quick list of all available commands.\n\n"
+
+            "<b>/help</b>\n"
+            "Shows this detailed guide with full explanations "
+            "of every command and how the bot works.\n\n"
+
+            "<b>/status</b>\n"
+            "Full live dashboard showing: market status "
+            "(open/closed), account balance, today's trades "
+            "and P&L, all-time stats (win rate, profit factor), "
+            "and all open positions with unrealized P&L.\n\n"
+
+            "<b>/positions</b>\n"
+            "Lists every open position with entry price, "
+            "current price, P&L, stop-loss, and take-profit "
+            "levels. Shows nothing if no positions are open.\n\n"
+
+            "<b>/pnl</b>\n"
+            "Quick P&L summary — today's realized P&L and "
+            "all-time cumulative P&L from bot-tracked trades.\n\n"
+
+            "<b>/risk</b>\n"
+            "Risk dashboard showing: NAV, daily loss halt "
+            "status, open position count vs max allowed, "
+            "max daily loss %, max per-trade risk %, minimum "
+            "reward-to-risk ratio, and whether longs/shorts "
+            "are enabled.\n\n"
+
+            "<b>/history</b>\n"
+            "Shows the last 20 completed trades with symbol, "
+            "direction, quantity, P&L, and exit reason "
+            "(take-profit, stop-loss, or time-based exit).\n\n"
+
+            "<b>/performance</b>\n"
+            "7-day performance table with date, number of "
+            "trades, wins, and gross P&L for each day.\n\n"
+
+            "<b>/watchlist</b>\n"
+            "Shows all symbols the bot is currently scanning "
+            "for trade opportunities.\n\n"
+
+            "<b>/add SYMBOL</b>\n"
+            "Add a stock ticker to the watchlist. Example: "
+            "<code>/add PLTR</code> — the bot will start "
+            "scanning PLTR for signals on the next cycle.\n\n"
+
+            "<b>/remove SYMBOL</b>\n"
+            "Remove a ticker from the watchlist. Example: "
+            "<code>/remove TSLA</code> — the bot stops "
+            "scanning TSLA (existing positions are NOT closed).\n\n"
+
+            "<b>/data SYMBOL</b>\n"
+            "Fetch live price data (bid, ask, last, volume, "
+            "high, low) and trigger an immediate AI scan on "
+            "that symbol. Example: <code>/data AAPL</code>\n\n"
+
+            "<b>/set key value</b>\n"
+            "Change a bot setting on the fly. Available keys:\n"
+            "  <code>confidence</code> — min AI confidence to trade (0-1)\n"
+            "  <code>max_daily_loss</code> — max daily loss % (0-1)\n"
+            "  <code>max_trade_risk</code> — max risk per trade % (0-1)\n"
+            "  <code>min_rr</code> — minimum reward:risk ratio\n"
+            "  <code>max_positions</code> — max open positions (0=unlimited)\n"
+            "  <code>allow_shorts</code> — true/false\n"
+            "  <code>allow_longs</code> — true/false\n"
+            "Example: <code>/set confidence 0.75</code>\n\n"
+
+            "<b>/stop</b>\n"
+            "Pause the trading engine. The bot stays connected "
+            "and monitors everything, but will NOT open new "
+            "positions. Existing positions keep their SL/TP.\n\n"
+
+            "<b>/resume</b>\n"
+            "Resume trading after a /stop pause.\n\n"
+
+            "<b>/kill</b>\n"
+            "Emergency shutdown. Closes ALL open positions "
+            "immediately and terminates the bot process. "
+            "Use only in emergencies.\n\n"
+
+            "=" * 35 + "\n"
+            "<b>What does the bot do when the market is closed?</b>\n"
+            "=" * 35 + "\n\n"
+            "When the market is closed (nights, weekends, "
+            "holidays), the bot:\n"
+            "- Stays connected to IB Gateway\n"
+            "- Runs a heartbeat every 60 seconds to monitor "
+            "system health\n"
+            "- Checks market status each heartbeat cycle\n"
+            "- Does NOT scan for trades or place orders\n"
+            "- Keeps Telegram commands active (you can still "
+            "use /status, /history, /performance, etc.)\n"
+            "- When the market opens, it automatically detects "
+            "the open, sends you a notification, and starts "
+            "scanning your watchlist for trade signals\n"
+            "- At market close, it sends a daily summary with "
+            "trade count, wins, and P&L\n\n"
+            "You do NOT need to restart the bot each day — "
+            "just leave it running."
         )
         await update.message.reply_text(text, parse_mode="HTML")
 
