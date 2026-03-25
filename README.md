@@ -81,4 +81,5 @@ Edit `config.yaml` to tune strategy, risk, and performance settings. All setting
 
 - **Paper trading only** by default (port 7497). Change to 7496 for live.
 - US stocks only, regular hours 09:30-16:00 ET.
-- PDT rule: $25k minimum for >3 day trades / 5 days in margin accounts (paper exempt).
+- Works with any account size — position sizing scales to your NAV automatically.
+- For live accounts under $25k, use a **cash account** to avoid PDT restrictions on margin accounts.
