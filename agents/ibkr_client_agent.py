@@ -45,9 +45,6 @@ class IBKRClientAgent(BaseAgent):
             self.ib.newOrderEvent += self._on_new_order
             self.ib.disconnectedEvent += self._on_disconnect
 
-            # Request account updates to keep data fresh
-            self.ib.reqAccountUpdates()
-
             asyncio.ensure_future(self._account_poll_loop())
 
         while self._running:
@@ -207,8 +204,8 @@ class IBKRClientAgent(BaseAgent):
     async def _poll_account(self):
         """Fetch account summary and open positions from IB using async methods."""
         try:
-            # Use accountValues() which returns cached data from reqAccountUpdates
-            account_values = self.ib.accountValues()
+            # Use async reqAccountSummaryAsync to avoid event loop conflict
+            account_values = await self.ib.reqAccountSummaryAsync()
 
             nav = 0.0
             buying_power = 0.0
@@ -216,17 +213,21 @@ class IBKRClientAgent(BaseAgent):
             unrealized_pnl = 0.0
 
             for av in account_values:
-                if av.tag == "NetLiquidationByCurrency" and av.currency == "USD":
+                if av.tag == "NetLiquidation":
                     nav = float(av.value)
                 elif av.tag == "BuyingPower":
                     buying_power = float(av.value)
-                elif av.tag == "RealizedPnL" and av.currency == "USD":
+                elif av.tag == "RealizedPnL":
                     realized_pnl = float(av.value)
-                elif av.tag == "UnrealizedPnL" and av.currency == "USD":
+                elif av.tag == "UnrealizedPnL":
                     unrealized_pnl = float(av.value)
 
-            # positions() returns cached data, no network call
-            positions = self.ib.positions()
+            # Cancel the subscription to avoid buildup
+            self.ib.cancelAccountSummary()
+
+            # Use async reqPositionsAsync
+            positions = await self.ib.reqPositionsAsync()
+            self.ib.cancelPositions()
 
             open_positions = []
             for pos in positions:
