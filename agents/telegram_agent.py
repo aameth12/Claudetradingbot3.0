@@ -235,7 +235,8 @@ class TelegramAgent(BaseAgent):
             return
 
         market_status = "\U0001f7e2 OPEN" if is_market_open() else "\U0001f534 CLOSED"
-        nav = self._account_data.get("nav", 0)
+        # Use account_data NAV, fall back to risk_data NAV
+        nav = self._account_data.get("nav") or self._risk_data.get("nav", 0)
         total_pnl = self._account_data.get("realized_pnl", 0) + self._account_data.get("unrealized_pnl", 0)
         paused = self._risk_data.get("paused", False)
         mode_str = "\u23f8 PAUSED" if paused else "\u25b6 RUNNING"
@@ -559,11 +560,30 @@ class TelegramAgent(BaseAgent):
             data = payload.get("data")
             symbol = payload.get("symbol")
             if data:
+                def _fmt(val, prefix="$"):
+                    return f"{prefix}{val:.2f}" if val is not None else "N/A"
+                def _fmt_vol(val):
+                    return f"{int(val):,}" if val is not None else "N/A"
+
+                bid = _fmt(data.get("bid"))
+                ask = _fmt(data.get("ask"))
+                last = _fmt(data.get("last"))
+                vol = _fmt_vol(data.get("volume"))
+                high = _fmt(data.get("high"))
+                low = _fmt(data.get("low"))
+
+                # Check if all values are N/A (market closed)
+                all_na = all(v is None for v in [
+                    data.get("bid"), data.get("ask"), data.get("last")
+                ])
+                market_note = "\n\n(Market is closed — live prices unavailable)" if all_na else ""
+
                 await self._send(
                     f"<b>{symbol} Live Data</b>\n"
-                    f"Bid: ${data.get('bid', 'N/A')} | Ask: ${data.get('ask', 'N/A')}\n"
-                    f"Last: ${data.get('last', 'N/A')} | Vol: {data.get('volume', 'N/A')}\n"
-                    f"High: ${data.get('high', 'N/A')} | Low: ${data.get('low', 'N/A')}"
+                    f"Bid: {bid} | Ask: {ask}\n"
+                    f"Last: {last} | Vol: {vol}\n"
+                    f"High: {high} | Low: {low}"
+                    f"{market_note}"
                 )
 
         elif msg_type == "risk_rejection":

@@ -224,14 +224,20 @@ class IBKRClientAgent(BaseAgent):
             unrealized_pnl = 0.0
 
             for av in account_values:
-                if av.tag == "NetLiquidationByCurrency" and av.currency == "USD":
-                    nav = float(av.value)
-                elif av.tag == "BuyingPower" and av.currency == "USD":
-                    buying_power = float(av.value)
-                elif av.tag == "RealizedPnL" and av.currency == "USD":
-                    realized_pnl = float(av.value)
-                elif av.tag == "UnrealizedPnL" and av.currency == "USD":
-                    unrealized_pnl = float(av.value)
+                tag = av.tag
+                cur = av.currency
+                try:
+                    val = float(av.value)
+                except (ValueError, TypeError):
+                    continue
+                if tag in ("NetLiquidation", "NetLiquidationByCurrency") and cur == "USD":
+                    nav = val
+                elif tag == "BuyingPower":
+                    buying_power = val
+                elif tag == "RealizedPnL" and cur == "USD":
+                    realized_pnl = val
+                elif tag == "UnrealizedPnL" and cur == "USD":
+                    unrealized_pnl = val
 
             # Read cached positions
             positions = self.ib.positions(account_id)
@@ -286,16 +292,29 @@ class IBKRClientAgent(BaseAgent):
         if not ticker:
             return None
 
+        import math
+
+        def _clean(val):
+            """Return None if value is nan, -1, or missing."""
+            if val is None:
+                return None
+            try:
+                if math.isnan(val) or val == -1:
+                    return None
+            except TypeError:
+                return None
+            return val
+
         return {
             "symbol": symbol,
-            "bid": ticker.bid if ticker.bid != -1 else None,
-            "ask": ticker.ask if ticker.ask != -1 else None,
-            "last": ticker.last if ticker.last != -1 else None,
-            "volume": ticker.volume if ticker.volume != -1 else None,
-            "open": ticker.open if ticker.open != -1 else None,
-            "high": ticker.high if ticker.high != -1 else None,
-            "low": ticker.low if ticker.low != -1 else None,
-            "close": ticker.close if ticker.close != -1 else None,
+            "bid": _clean(ticker.bid),
+            "ask": _clean(ticker.ask),
+            "last": _clean(ticker.last),
+            "volume": _clean(ticker.volume),
+            "open": _clean(ticker.open),
+            "high": _clean(ticker.high),
+            "low": _clean(ticker.low),
+            "close": _clean(ticker.close),
         }
 
     async def get_historical_bars(self, symbol: str, duration: str = "5 D", bar_size: str = "1 min") -> list:
