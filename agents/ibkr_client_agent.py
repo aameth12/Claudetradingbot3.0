@@ -200,20 +200,23 @@ class IBKRClientAgent(BaseAgent):
                 await self._poll_account()
             except Exception as e:
                 logger.warning(f"Account poll error: {e}")
-            await asyncio.sleep(10)
+            await asyncio.sleep(30)
 
     async def _poll_account(self):
-        """Fetch account summary and open positions from IB using async methods."""
+        """Fetch account and position data from IB using managed accounts."""
         try:
-            # Request account summary — cancel any previous one first
-            if self._acct_summary_reqid is not None:
-                self.ib.client.cancelAccountSummary(self._acct_summary_reqid)
-                self._acct_summary_reqid = None
+            # Use managedAccounts to get account ID, then request updates
+            accounts = self.ib.managedAccounts()
+            if not accounts:
+                return
+            account_id = accounts[0]
 
-            account_values = await self.ib.reqAccountSummaryAsync()
-            # Store the reqId so we can cancel it next time
-            if account_values:
-                self._acct_summary_reqid = getattr(account_values[0], 'reqId', None) if account_values else None
+            # Request account values via async wrapper
+            await self.ib.reqAccountUpdatesAsync(account_id)
+            await asyncio.sleep(1)  # Give IB time to send the data
+
+            # Now read the cached values
+            account_values = self.ib.accountValues(account_id)
 
             nav = 0.0
             buying_power = 0.0
@@ -221,17 +224,17 @@ class IBKRClientAgent(BaseAgent):
             unrealized_pnl = 0.0
 
             for av in account_values:
-                if av.tag == "NetLiquidation":
+                if av.tag == "NetLiquidationByCurrency" and av.currency == "USD":
                     nav = float(av.value)
-                elif av.tag == "BuyingPower":
+                elif av.tag == "BuyingPower" and av.currency == "USD":
                     buying_power = float(av.value)
-                elif av.tag == "RealizedPnL":
+                elif av.tag == "RealizedPnL" and av.currency == "USD":
                     realized_pnl = float(av.value)
-                elif av.tag == "UnrealizedPnL":
+                elif av.tag == "UnrealizedPnL" and av.currency == "USD":
                     unrealized_pnl = float(av.value)
 
-            # Use async reqPositionsAsync
-            positions = await self.ib.reqPositionsAsync()
+            # Read cached positions
+            positions = self.ib.positions(account_id)
 
             open_positions = []
             for pos in positions:
