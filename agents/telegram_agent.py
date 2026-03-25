@@ -2,6 +2,8 @@
 
 import asyncio
 import os
+import subprocess
+import sys
 
 from loguru import logger
 from telegram import Update
@@ -68,6 +70,7 @@ class TelegramAgent(BaseAgent):
             "resume": self._cmd_resume,
             "kill": self._cmd_kill,
             "help": self._cmd_help,
+            "update": self._cmd_update,
         }
         for name, handler in commands.items():
             self.app.add_handler(CommandHandler(name, handler))
@@ -113,7 +116,8 @@ class TelegramAgent(BaseAgent):
             "/set key value — Tune settings\n"
             "/stop — Pause trading\n"
             "/resume — Resume trading\n"
-            "/kill — Emergency shutdown"
+            "/kill — Emergency shutdown\n"
+            "/update — Pull latest code from GitHub"
         )
         await update.message.reply_text(text, parse_mode="HTML")
 
@@ -121,112 +125,110 @@ class TelegramAgent(BaseAgent):
         if not self._auth(update):
             return
 
-        text = (
-            "<b>AI Trading Bot — Full Command Guide</b>\n"
-            "=" * 35 + "\n\n"
+        # Split into multiple messages to stay under Telegram's 4096 char limit
+        msg1 = (
+            "<b>AI Trading Bot — Command Guide (1/3)</b>\n\n"
+            "<b>/start</b> — Quick command list\n\n"
+            "<b>/help</b> — This detailed guide\n\n"
+            "<b>/status</b> — Full dashboard: market status, "
+            "balance, today's trades & P&L, all-time stats, "
+            "and open positions.\n\n"
+            "<b>/positions</b> — Open positions with entry "
+            "price, current price, P&L, SL & TP levels.\n\n"
+            "<b>/pnl</b> — Today's and all-time P&L.\n\n"
+            "<b>/risk</b> — Risk dashboard: NAV, daily loss "
+            "halt, position count, max loss %, max trade "
+            "risk %, min R:R, longs/shorts status.\n\n"
+            "<b>/history</b> — Last 20 trades with P&L "
+            "and exit reason.\n\n"
+            "<b>/performance</b> — 7-day table with trades, "
+            "wins, and P&L per day."
+        )
 
-            "<b>/start</b>\n"
-            "Shows a quick list of all available commands.\n\n"
-
-            "<b>/help</b>\n"
-            "Shows this detailed guide with full explanations "
-            "of every command and how the bot works.\n\n"
-
-            "<b>/status</b>\n"
-            "Full live dashboard showing: market status "
-            "(open/closed), account balance, today's trades "
-            "and P&L, all-time stats (win rate, profit factor), "
-            "and all open positions with unrealized P&L.\n\n"
-
-            "<b>/positions</b>\n"
-            "Lists every open position with entry price, "
-            "current price, P&L, stop-loss, and take-profit "
-            "levels. Shows nothing if no positions are open.\n\n"
-
-            "<b>/pnl</b>\n"
-            "Quick P&L summary — today's realized P&L and "
-            "all-time cumulative P&L from bot-tracked trades.\n\n"
-
-            "<b>/risk</b>\n"
-            "Risk dashboard showing: NAV, daily loss halt "
-            "status, open position count vs max allowed, "
-            "max daily loss %, max per-trade risk %, minimum "
-            "reward-to-risk ratio, and whether longs/shorts "
-            "are enabled.\n\n"
-
-            "<b>/history</b>\n"
-            "Shows the last 20 completed trades with symbol, "
-            "direction, quantity, P&L, and exit reason "
-            "(take-profit, stop-loss, or time-based exit).\n\n"
-
-            "<b>/performance</b>\n"
-            "7-day performance table with date, number of "
-            "trades, wins, and gross P&L for each day.\n\n"
-
-            "<b>/watchlist</b>\n"
-            "Shows all symbols the bot is currently scanning "
-            "for trade opportunities.\n\n"
-
-            "<b>/add SYMBOL</b>\n"
-            "Add a stock ticker to the watchlist. Example: "
-            "<code>/add PLTR</code> — the bot will start "
-            "scanning PLTR for signals on the next cycle.\n\n"
-
-            "<b>/remove SYMBOL</b>\n"
-            "Remove a ticker from the watchlist. Example: "
-            "<code>/remove TSLA</code> — the bot stops "
-            "scanning TSLA (existing positions are NOT closed).\n\n"
-
-            "<b>/data SYMBOL</b>\n"
-            "Fetch live price data (bid, ask, last, volume, "
-            "high, low) and trigger an immediate AI scan on "
-            "that symbol. Example: <code>/data AAPL</code>\n\n"
-
-            "<b>/set key value</b>\n"
-            "Change a bot setting on the fly. Available keys:\n"
-            "  <code>confidence</code> — min AI confidence to trade (0-1)\n"
-            "  <code>max_daily_loss</code> — max daily loss % (0-1)\n"
-            "  <code>max_trade_risk</code> — max risk per trade % (0-1)\n"
-            "  <code>min_rr</code> — minimum reward:risk ratio\n"
-            "  <code>max_positions</code> — max open positions (0=unlimited)\n"
+        msg2 = (
+            "<b>Command Guide (2/3)</b>\n\n"
+            "<b>/watchlist</b> — Current symbols being scanned.\n\n"
+            "<b>/add SYMBOL</b> — Add ticker to watchlist.\n"
+            "Example: <code>/add PLTR</code>\n\n"
+            "<b>/remove SYMBOL</b> — Remove ticker. Existing "
+            "positions are NOT closed.\n"
+            "Example: <code>/remove TSLA</code>\n\n"
+            "<b>/data SYMBOL</b> — Live price + instant AI scan.\n"
+            "Example: <code>/data AAPL</code>\n\n"
+            "<b>/set key value</b> — Change settings live:\n"
+            "  <code>confidence</code> — AI threshold (0-1)\n"
+            "  <code>max_daily_loss</code> — daily loss % (0-1)\n"
+            "  <code>max_trade_risk</code> — per-trade risk %\n"
+            "  <code>min_rr</code> — reward:risk ratio\n"
+            "  <code>max_positions</code> — max open (0=unlimited)\n"
             "  <code>allow_shorts</code> — true/false\n"
             "  <code>allow_longs</code> — true/false\n"
             "Example: <code>/set confidence 0.75</code>\n\n"
+            "<b>/stop</b> — Pause trading. Bot stays connected, "
+            "existing positions keep SL/TP.\n\n"
+            "<b>/resume</b> — Resume after pause.\n\n"
+            "<b>/kill</b> — Emergency: closes ALL positions "
+            "and shuts down the bot.\n\n"
+            "<b>/update</b> — Pull latest code from GitHub "
+            "and restart the bot with new changes."
+        )
 
-            "<b>/stop</b>\n"
-            "Pause the trading engine. The bot stays connected "
-            "and monitors everything, but will NOT open new "
-            "positions. Existing positions keep their SL/TP.\n\n"
-
-            "<b>/resume</b>\n"
-            "Resume trading after a /stop pause.\n\n"
-
-            "<b>/kill</b>\n"
-            "Emergency shutdown. Closes ALL open positions "
-            "immediately and terminates the bot process. "
-            "Use only in emergencies.\n\n"
-
-            "=" * 35 + "\n"
-            "<b>What does the bot do when the market is closed?</b>\n"
-            "=" * 35 + "\n\n"
-            "When the market is closed (nights, weekends, "
-            "holidays), the bot:\n"
-            "- Stays connected to IB Gateway\n"
-            "- Runs a heartbeat every 60 seconds to monitor "
-            "system health\n"
-            "- Checks market status each heartbeat cycle\n"
-            "- Does NOT scan for trades or place orders\n"
-            "- Keeps Telegram commands active (you can still "
-            "use /status, /history, /performance, etc.)\n"
-            "- When the market opens, it automatically detects "
-            "the open, sends you a notification, and starts "
-            "scanning your watchlist for trade signals\n"
-            "- At market close, it sends a daily summary with "
-            "trade count, wins, and P&L\n\n"
-            "You do NOT need to restart the bot each day — "
+        msg3 = (
+            "<b>Command Guide (3/3)</b>\n\n"
+            "<b>When the market is closed:</b>\n"
+            "- Bot stays connected to IB Gateway\n"
+            "- Heartbeat runs every 60s monitoring health\n"
+            "- Does NOT scan or place orders\n"
+            "- Telegram commands stay active\n"
+            "- Auto-detects market open and starts trading\n"
+            "- Sends daily summary at market close\n\n"
+            "You do NOT need to restart each day — "
             "just leave it running."
         )
-        await update.message.reply_text(text, parse_mode="HTML")
+
+        await update.message.reply_text(msg1, parse_mode="HTML")
+        await update.message.reply_text(msg2, parse_mode="HTML")
+        await update.message.reply_text(msg3, parse_mode="HTML")
+
+    async def _cmd_update(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._auth(update):
+            return
+        await update.message.reply_text(
+            "\U0001f504 Pulling latest code from GitHub...", parse_mode="HTML"
+        )
+        try:
+            # Run git pull in the bot's directory
+            bot_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            result = subprocess.run(
+                ["git", "pull", "origin", "main"],
+                cwd=bot_dir,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            output = result.stdout.strip() or result.stderr.strip()
+            if result.returncode == 0:
+                if "Already up to date" in output:
+                    await update.message.reply_text(
+                        "\u2705 Already up to date. No changes.", parse_mode="HTML"
+                    )
+                else:
+                    await update.message.reply_text(
+                        f"\u2705 Updated!\n<pre>{output[:1000]}</pre>\n\n"
+                        "\U0001f504 Restarting bot...",
+                        parse_mode="HTML",
+                    )
+                    # Restart the bot process
+                    os.execv(sys.executable, [sys.executable] + sys.argv)
+            else:
+                await update.message.reply_text(
+                    f"\u274c Update failed:\n<pre>{output[:1000]}</pre>",
+                    parse_mode="HTML",
+                )
+        except Exception as e:
+            await update.message.reply_text(
+                f"\u274c Update error: {e}", parse_mode="HTML"
+            )
 
     async def _cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._auth(update):
