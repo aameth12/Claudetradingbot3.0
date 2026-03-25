@@ -221,7 +221,8 @@ class TelegramAgent(BaseAgent):
             f"NAV: ${r.get('nav', 0):,.0f}\n"
             f"Daily Loss Halt: {'YES \U0001f6d1' if r.get('daily_loss_halt') else 'No'}\n"
             f"Open Positions: {r.get('open_positions_count', 0)}"
-            f"{f' / {r[\"max_positions\"]}' if r.get('max_positions', 0) > 0 else ''}\n"
+            + (f" / {r.get('max_positions', 0)}" if r.get('max_positions', 0) > 0 else "")
+            + "\n"
             f"Max Daily Loss: {r.get('max_daily_loss_pct', 0) * 100:.0f}%\n"
             f"Max Trade Risk: {r.get('max_trade_risk_pct', 0) * 100:.0f}%\n"
             f"Min R:R: {r.get('min_rr_ratio', 0):.1f}\n"
