@@ -35,6 +35,7 @@ class IBKRClientAgent(BaseAgent):
         self._account_data: dict = {}
         self._active_orders: dict[int, dict] = {}
         self._bracket_groups: dict[int, dict] = {}
+        self._acct_summary_reqid = None
 
     async def run(self):
         """Main loop: connect, subscribe events, poll account."""
@@ -204,8 +205,15 @@ class IBKRClientAgent(BaseAgent):
     async def _poll_account(self):
         """Fetch account summary and open positions from IB using async methods."""
         try:
-            # Use async reqAccountSummaryAsync to avoid event loop conflict
+            # Request account summary — cancel any previous one first
+            if self._acct_summary_reqid is not None:
+                self.ib.client.cancelAccountSummary(self._acct_summary_reqid)
+                self._acct_summary_reqid = None
+
             account_values = await self.ib.reqAccountSummaryAsync()
+            # Store the reqId so we can cancel it next time
+            if account_values:
+                self._acct_summary_reqid = getattr(account_values[0], 'reqId', None) if account_values else None
 
             nav = 0.0
             buying_power = 0.0
@@ -222,12 +230,8 @@ class IBKRClientAgent(BaseAgent):
                 elif av.tag == "UnrealizedPnL":
                     unrealized_pnl = float(av.value)
 
-            # Cancel the subscription to avoid buildup
-            self.ib.cancelAccountSummary()
-
             # Use async reqPositionsAsync
             positions = await self.ib.reqPositionsAsync()
-            self.ib.cancelPositions()
 
             open_positions = []
             for pos in positions:
