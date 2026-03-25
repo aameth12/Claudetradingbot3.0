@@ -1,5 +1,6 @@
 """RiskAgent — Risk rules enforcement for every trade signal."""
 
+import asyncio
 import math
 from datetime import date, datetime
 
@@ -217,7 +218,3 @@ class RiskAgent(BaseAgent):
         elif msg_type == "position_closed_notify":
             symbol = payload.get("symbol")
             self._open_positions.pop(symbol, None)
-
-
-# Required for the run() method
-import asyncio

@@ -75,7 +75,7 @@ class Orchestrator:
 
         # Subscribe to market data after IBKR connects
         await asyncio.sleep(5)
-        self.ibkr_agent.send("IBKRClientAgent", "subscribe_symbols", {"symbols": self.watchlist})
+        await self.ibkr_agent.subscribe_market_data(self.watchlist)
 
         # Start background tasks
         self._tasks.append(asyncio.create_task(self._heartbeat(), name="heartbeat"))
