@@ -197,10 +197,21 @@ class TelegramAgent(BaseAgent):
             "\U0001f504 Pulling latest code from GitHub...", parse_mode="HTML"
         )
         try:
-            # Run git pull in the bot's directory
             bot_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+            # Get current branch name
+            branch_result = subprocess.run(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                cwd=bot_dir,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            branch = branch_result.stdout.strip() or "main"
+
+            # Pull from current branch
             result = subprocess.run(
-                ["git", "pull", "origin", "main"],
+                ["git", "pull", "origin", branch],
                 cwd=bot_dir,
                 capture_output=True,
                 text=True,
@@ -210,11 +221,12 @@ class TelegramAgent(BaseAgent):
             if result.returncode == 0:
                 if "Already up to date" in output:
                     await update.message.reply_text(
-                        "\u2705 Already up to date. No changes.", parse_mode="HTML"
+                        f"\u2705 Already up to date ({branch}). No changes.",
+                        parse_mode="HTML",
                     )
                 else:
                     await update.message.reply_text(
-                        f"\u2705 Updated!\n<pre>{output[:1000]}</pre>\n\n"
+                        f"\u2705 Updated ({branch})!\n<pre>{output[:1000]}</pre>\n\n"
                         "\U0001f504 Restarting bot...",
                         parse_mode="HTML",
                     )
@@ -222,7 +234,7 @@ class TelegramAgent(BaseAgent):
                     os.execv(sys.executable, [sys.executable] + sys.argv)
             else:
                 await update.message.reply_text(
-                    f"\u274c Update failed:\n<pre>{output[:1000]}</pre>",
+                    f"\u274c Update failed ({branch}):\n<pre>{output[:1000]}</pre>",
                     parse_mode="HTML",
                 )
         except Exception as e:
