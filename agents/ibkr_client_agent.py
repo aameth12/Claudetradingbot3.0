@@ -89,7 +89,20 @@ class IBKRClientAgent(BaseAgent):
             pass  # Already handled
         # 201 = Order rejected
         elif errorCode == 201:
-            if "Pattern Day Trader" in errorString or "PDT" in errorString:
+            if "Exchange is closed" in errorString or "exchange is closed" in errorString:
+                # Order arrived just after market close — not a code bug, just bad timing
+                symbol = "???"
+                for parent_id, info in self._bracket_groups.items():
+                    if reqId in (parent_id, info.get("sl_order_id"), info.get("tp_order_id")):
+                        symbol = info.get("symbol", "???")
+                        break
+                logger.warning(f"Order rejected — exchange closed for {symbol} (reqId={reqId}). Will retry next session.")
+                self.broadcast("order_rejected", {
+                    "symbol": symbol,
+                    "order_id": reqId,
+                    "reason": "Exchange is closed. Order arrived after market close.",
+                })
+            elif "Pattern Day Trader" in errorString or "PDT" in errorString:
                 # contract is None for 201 in ib_insync — look up symbol from bracket groups
                 symbol = "???"
                 for parent_id, info in self._bracket_groups.items():

@@ -19,7 +19,11 @@ def now_et() -> datetime:
 
 
 def is_market_open() -> bool:
-    """Check if NYSE is currently open (regular hours only)."""
+    """Check if NYSE is currently open (regular hours only).
+    Stops 10 minutes before close to avoid late-day order rejections
+    while Ollama is still processing signals.
+    """
+    from datetime import timedelta
     now = now_et()
     today = now.date()
     schedule = _nyse.schedule(start_date=today, end_date=today)
@@ -27,7 +31,8 @@ def is_market_open() -> bool:
         return False
     market_open = schedule.iloc[0]["market_open"].to_pydatetime().astimezone(ET)
     market_close = schedule.iloc[0]["market_close"].to_pydatetime().astimezone(ET)
-    return market_open <= now <= market_close
+    cutoff = market_close - timedelta(minutes=10)  # stop at 3:50 PM ET
+    return market_open <= now <= cutoff
 
 
 def next_market_open() -> datetime | None:
