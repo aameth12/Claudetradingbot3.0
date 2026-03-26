@@ -303,11 +303,13 @@ class StrategyAgent(BaseAgent):
                     content = content[4:]
                 content = content.strip()
 
-            # Try to find JSON object in the response text
+            # Try to find JSON object in the response text (handles nested braces)
             import re
-            json_match = re.search(r'\{[^{}]*\}', content, re.DOTALL)
-            if json_match:
-                content = json_match.group()
+            # Find the first { and last } to capture the full JSON object
+            first_brace = content.find("{")
+            last_brace = content.rfind("}")
+            if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+                content = content[first_brace:last_brace + 1]
 
             signal = json.loads(content)
             logger.info(f"Ollama signal for {symbol}: {signal.get('action')} (conf: {signal.get('confidence')})")
