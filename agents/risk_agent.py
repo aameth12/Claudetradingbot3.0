@@ -133,6 +133,15 @@ class RiskAgent(BaseAgent):
         if quantity < 1:
             return False, f"Quantity < 1 (risk=${max_risk_dollars:.2f}, sl_dist=${sl_dist:.2f})", signal
 
+        # Cap total position value to available buying power (max 90% of NAV)
+        max_position_value = self._nav * 0.90
+        max_qty_by_value = math.floor(max_position_value / entry_price) if entry_price > 0 else 0
+        if max_qty_by_value < 1:
+            return False, f"Cannot afford even 1 share of {symbol} @ ${entry_price:.2f}", signal
+        if quantity > max_qty_by_value:
+            quantity = max_qty_by_value
+            logger.info(f"Position sized down to {quantity} shares for {symbol} (max 90% NAV = ${max_position_value:,.0f})")
+
         risk_dollars = quantity * sl_dist
         reward_dollars = quantity * tp_dist
 
