@@ -28,6 +28,9 @@ class RiskAgent(BaseAgent):
         self._open_positions: dict[str, dict] = {}
         self._daily_loss_halt = False
         self._daily_loss_halt_date: date | None = None
+        # PDT day trade counter (same-day round trips)
+        self._day_trades_today = 0
+        self._day_trades_date: date | None = None
 
     async def run(self):
         while self._running:
@@ -36,12 +39,17 @@ class RiskAgent(BaseAgent):
             await asyncio.sleep(0.5)
 
     def _check_daily_loss_reset(self):
-        """Reset daily loss halt on new calendar day."""
+        """Reset daily loss halt and day trade counter on new calendar day."""
+        today = date.today()
         if self._daily_loss_halt and self._daily_loss_halt_date:
-            if date.today() > self._daily_loss_halt_date:
+            if today > self._daily_loss_halt_date:
                 self._daily_loss_halt = False
                 self._daily_loss_halt_date = None
                 logger.info("Daily loss halt reset for new day")
+        if self._day_trades_date and today > self._day_trades_date:
+            self._day_trades_today = 0
+            self._day_trades_date = None
+            logger.info("Day trade counter reset for new day")
 
     def validate_signal(self, signal: dict) -> tuple[bool, str, dict]:
         """
@@ -61,6 +69,13 @@ class RiskAgent(BaseAgent):
         # 2. DAILY LOSS HALT
         if self._daily_loss_halt:
             return False, "Daily loss limit reached", signal
+
+        # 2b. PDT PROTECTION: max 3 day trades per day when NAV < $25,000
+        if self._nav < 25000 and self._day_trades_today >= 3:
+            return False, (
+                f"PDT limit: {self._day_trades_today} day trades used today "
+                "(max 3 for accounts under $25k). Wait until tomorrow or deposit funds."
+            ), signal
 
         total_pnl = self._realized_pnl + self._unrealized_pnl
         max_loss = self._nav * self.max_daily_loss_pct
@@ -173,6 +188,8 @@ class RiskAgent(BaseAgent):
             "allow_shorts": self.allow_shorts,
             "allow_longs": self.allow_longs,
             "paused": self._paused,
+            "day_trades_today": self._day_trades_today,
+            "pdt_protected": self._nav < 25000,
         }
 
     async def handle_message(self, message: Message):
@@ -227,3 +244,9 @@ class RiskAgent(BaseAgent):
         elif msg_type == "position_closed_notify":
             symbol = payload.get("symbol")
             self._open_positions.pop(symbol, None)
+
+        elif msg_type == "day_trade_completed":
+            # Increment day trade counter when a position is opened and closed same day
+            self._day_trades_today += 1
+            self._day_trades_date = date.today()
+            logger.info(f"Day trade #{self._day_trades_today} recorded (NAV=${self._nav:,.0f})")

@@ -198,8 +198,17 @@ class ExecutionAgent(BaseAgent):
         )
         self.send("TelegramAgent", "send_message", {"text": alert_text})
 
-        # Notify RiskAgent
+        # Notify RiskAgent of close
         self.send("RiskAgent", "position_closed_notify", {"symbol": symbol})
+
+        # If opened and closed same calendar day → counts as a day trade
+        try:
+            entry_dt = datetime.fromisoformat(str(entry_time))
+            exit_dt = datetime.fromisoformat(str(exec_time))
+            if entry_dt.date() == exit_dt.date():
+                self.send("RiskAgent", "day_trade_completed", {"symbol": symbol})
+        except Exception:
+            pass
 
         # Remove from open trades
         del self._open_trades[symbol]

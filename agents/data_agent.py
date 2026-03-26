@@ -1,4 +1,9 @@
-"""DataAgent — OHLCV cache for 1m/5m/15m bars, in-memory only."""
+"""DataAgent — Real-time OHLCV cache for live bar updates from IBKR.
+
+Scanning data is now sourced directly from yfinance in StrategyAgent.
+This agent handles only real-time bar updates (new_bar events) and
+responds to data_request messages for live price display (/data command).
+"""
 
 import asyncio
 from collections import defaultdict
@@ -20,24 +25,10 @@ class DataAgent(BaseAgent):
         self._ready: set[str] = set()
 
     async def run(self):
-        """Request historical bars for all symbols on startup, then process inbox."""
-        await asyncio.sleep(2)  # Wait for IBKRClientAgent to connect
-        await self._load_initial_data()
-
+        """Process inbox — respond to data_request and new_bar messages."""
         while self._running:
             await self._process_inbox()
             await asyncio.sleep(0.1)
-
-    async def _load_initial_data(self):
-        """Request 5 days of 1-min bars for each watchlist symbol."""
-        logger.info(f"Loading initial data for {len(self.watchlist)} symbols...")
-        for symbol in self.watchlist:
-            self.send("IBKRClientAgent", "get_historical_bars", {
-                "symbol": symbol,
-                "duration": "5 D",
-                "bar_size": "1 min",
-            })
-            await asyncio.sleep(1)  # Rate limit
 
     def _bars_to_df(self, bars) -> pd.DataFrame:
         """Convert ib_insync BarData list to a pandas DataFrame."""
@@ -109,14 +100,7 @@ class DataAgent(BaseAgent):
         msg_type = message.type
         payload = message.payload
 
-        if msg_type == "historical_bars_response":
-            symbol = payload.get("symbol")
-            bars = payload.get("bars", [])
-            df = self._bars_to_df(bars)
-            self._update_cache(symbol, df)
-            logger.info(f"Loaded {len(df)} bars for {symbol}")
-
-        elif msg_type == "data_request":
+        if msg_type == "data_request":
             symbol = payload.get("symbol")
             timeframe = payload.get("timeframe", "1m")
             n_bars = payload.get("n_bars", 100)

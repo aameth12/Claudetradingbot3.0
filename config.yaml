@@ -30,7 +30,7 @@ watchlist:
   - DELL
 
 strategy:
-  scan_interval_seconds: 60
+  scan_interval_seconds: 120
   confidence_threshold: 0.65
   timeframes:
     - 1m

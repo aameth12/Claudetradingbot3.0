@@ -12,3 +12,4 @@ loguru>=0.7.0
 tenacity>=8.2.0
 pandas-market-calendars>=4.4.0
 nest_asyncio>=1.5.0
+yfinance>=0.2.40

@@ -37,6 +37,7 @@ class IBKRClientAgent(BaseAgent):
         self._bracket_groups: dict[int, dict] = {}
         self._acct_summary_reqid = None
         self._failed_symbols: set[str] = set()
+        self._paused = False  # local flag to prevent double-pause broadcasts
 
     async def run(self):
         """Main loop: connect, subscribe events, poll account."""
@@ -89,18 +90,26 @@ class IBKRClientAgent(BaseAgent):
         # 201 = Order rejected
         elif errorCode == 201:
             if "Pattern Day Trader" in errorString or "PDT" in errorString:
-                symbol = getattr(contract, "symbol", "???") if contract else "???"
-                logger.warning(f"PDT rejection on {symbol}: {errorString}")
-                self.broadcast("pause", {})
-                logger.warning("Auto-paused trading due to PDT rejection")
-                self.broadcast("order_rejected", {
-                    "symbol": symbol,
-                    "order_id": reqId,
-                    "reason": (
-                        "PDT rule: Account flagged as Pattern Day Trader (under $25k). "
-                        "In IB, switch your account to Cash type to bypass PDT restrictions."
-                    ),
-                })
+                # contract is None for 201 in ib_insync — look up symbol from bracket groups
+                symbol = "???"
+                for parent_id, info in self._bracket_groups.items():
+                    if reqId in (parent_id, info.get("sl_order_id"), info.get("tp_order_id")):
+                        symbol = info.get("symbol", "???")
+                        break
+                logger.warning(f"PDT rejection on {symbol} (reqId={reqId}): {errorString[:120]}")
+                # Prevent double-pause (also triggered by _on_order_status)
+                if not self._paused:
+                    self._paused = True
+                    self.broadcast("pause", {})
+                    logger.warning("Auto-paused trading due to PDT rejection")
+                    self.broadcast("order_rejected", {
+                        "symbol": symbol,
+                        "order_id": reqId,
+                        "reason": (
+                            "PDT rule: Account under $25k equity — Pattern Day Trader restriction. "
+                            "Fix: In IB Client Portal → Account Settings → change to Cash account type."
+                        ),
+                    })
         # Log other errors
         elif errorCode not in (2104, 2106, 2158, 2119):  # Skip info/connection msgs
             symbol = getattr(contract, 'symbol', '') if contract else ''
@@ -232,10 +241,14 @@ class IBKRClientAgent(BaseAgent):
                     for log_entry in log_entries:
                         msg = getattr(log_entry, 'message', '')
                         if 'Pattern Day Trader' in msg or 'PDT' in msg:
-                            reason = "PDT rule: Account under $25k. Switch to Cash account in IB to bypass."
-                            # Auto-pause to stop further rejected orders
-                            self.broadcast("pause", {})
-                            logger.warning("Auto-paused trading due to PDT rejection")
+                            reason = (
+                                "PDT rule: Account under $25k equity. "
+                                "Fix: In IB Client Portal → Account Settings → change to Cash account type."
+                            )
+                            if not self._paused:
+                                self._paused = True
+                                self.broadcast("pause", {})
+                                logger.warning("Auto-paused trading due to PDT rejection")
                             break
 
                     self.broadcast("order_rejected", {
@@ -546,6 +559,9 @@ class IBKRClientAgent(BaseAgent):
         elif msg_type == "subscribe_symbols":
             symbols = payload.get("symbols", [])
             await self.subscribe_market_data(symbols)
+
+        elif msg_type == "resume":
+            self._paused = False
 
         elif msg_type == "get_account":
             self.send(message.sender, "account_response", self._account_data)

@@ -1,4 +1,9 @@
-"""StrategyAgent — Indicators + Ollama AI signals."""
+"""StrategyAgent — Indicators + Ollama AI signals.
+
+Data source: yfinance (free, no subscriptions, reliable intraday bars).
+Scan flow: sequential per symbol — fetch → indicators → confluence → Ollama → signal.
+Ollama is skipped entirely when confluence score is too mixed (|score| < 0.15).
+"""
 
 import asyncio
 import json
@@ -20,24 +25,26 @@ try:
 except ImportError:
     ollama_client = None
 
+try:
+    import yfinance as yf
+except ImportError:
+    yf = None
+
 
 class StrategyAgent(BaseAgent):
     def __init__(self, config: dict, watchlist: list[str], orchestrator=None):
         super().__init__("StrategyAgent", orchestrator)
         self.watchlist = list(watchlist)
-        self.scan_interval = config.get("scan_interval_seconds", 60)
+        self.scan_interval = config.get("scan_interval_seconds", 120)
         self.confidence_threshold = config.get("confidence_threshold", 0.65)
         self.allow_shorts = config.get("allow_shorts", True)
         self.allow_longs = config.get("allow_longs", True)
         self.ollama_model = "mistral"
-        self.ollama_timeout = 30
         self._paused = False
-        self._pending_data: dict[str, dict] = {}
         self._cool_downs: dict[str, bool] = {}
-        self._ready_queue: list[tuple[str, dict]] = []
 
     async def run(self):
-        """Main loop: scan symbols periodically during market hours."""
+        """Main loop: scan symbols sequentially during market hours."""
         while self._running:
             await self._process_inbox()
 
@@ -46,37 +53,72 @@ class StrategyAgent(BaseAgent):
 
             await asyncio.sleep(self.scan_interval)
 
-    async def _scan_all_symbols(self):
-        """Scan each watchlist symbol — request data for all, then analyze in parallel."""
-        logger.info("Starting strategy scan cycle")
+    # ─── Data Fetching ────────────────────────────────────────────────
 
-        # Request data for all symbols at once
-        symbols_to_scan = []
+    async def _fetch_yfinance_data(self, symbol: str) -> dict[str, pd.DataFrame]:
+        """Download 2 days of 1m bars from yfinance and resample to 5m/15m."""
+        if yf is None:
+            logger.error("yfinance not installed — run: pip install yfinance")
+            return {}
+        try:
+            ticker_obj = yf.Ticker(symbol)
+            df = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: ticker_obj.history(period="2d", interval="1m"),
+            )
+
+            if df is None or df.empty or len(df) < 20:
+                logger.warning(f"yfinance: insufficient data for {symbol} ({len(df) if df is not None else 0} bars)")
+                return {}
+
+            # Normalize: strip timezone (pandas_ta compatibility), lowercase columns
+            df.index = df.index.tz_localize(None) if df.index.tz is not None else df.index
+            df.columns = [c.lower() for c in df.columns]
+
+            # Keep only OHLCV columns
+            ohlcv = ["open", "high", "low", "close", "volume"]
+            df = df[[c for c in ohlcv if c in df.columns]]
+
+            df_5m = df.resample("5min").agg({
+                "open": "first", "high": "max", "low": "min",
+                "close": "last", "volume": "sum",
+            }).dropna()
+
+            df_15m = df.resample("15min").agg({
+                "open": "first", "high": "max", "low": "min",
+                "close": "last", "volume": "sum",
+            }).dropna()
+
+            logger.debug(f"yfinance: {symbol} — 1m={len(df)} 5m={len(df_5m)} 15m={len(df_15m)} bars")
+            return {"1m": df, "5m": df_5m, "15m": df_15m}
+
+        except Exception as e:
+            logger.warning(f"yfinance error for {symbol}: {e}")
+            return {}
+
+    # ─── Scanning ─────────────────────────────────────────────────────
+
+    async def _scan_all_symbols(self):
+        """Scan each watchlist symbol sequentially: fetch → indicators → Ollama → signal."""
+        logger.info(f"Starting strategy scan ({len(self.watchlist)} symbols)")
+
         for symbol in self.watchlist:
             if self._paused:
+                logger.info("Scan aborted — bot paused")
                 return
             if self._cool_downs.get(symbol, False):
-                logger.debug(f"Skipping {symbol} — cooled down")
+                logger.debug(f"Skipping {symbol} — in cool-down")
                 continue
+
             self.send("PerformanceAgent", "check_cool_down", {"symbol": symbol})
-            symbols_to_scan.append(symbol)
 
-        # Fire all data requests at once (non-blocking)
-        for symbol in symbols_to_scan:
-            await self._request_data_and_analyze(symbol)
+            data_by_tf = await self._fetch_yfinance_data(symbol)
+            if data_by_tf:
+                await self._analyze_symbol(symbol, data_by_tf)
 
-        # Data responses arrive via handle_message and trigger _analyze_symbol
-        # The Ollama calls will be queued as data comes in
+        logger.info("Scan cycle complete")
 
-    async def _request_data_and_analyze(self, symbol: str):
-        """Request data from DataAgent and run analysis."""
-        for timeframe in ["1m", "5m", "15m"]:
-            self.send("DataAgent", "data_request", {
-                "symbol": symbol,
-                "timeframe": timeframe,
-                "n_bars": 100,
-                "request_id": f"{symbol}_{timeframe}",
-            })
+    # ─── Indicators ───────────────────────────────────────────────────
 
     def _compute_indicators(self, df: pd.DataFrame) -> dict:
         """Compute all technical indicators using pandas-ta."""
@@ -236,6 +278,8 @@ class StrategyAgent(BaseAgent):
             "signals": signals,
         }
 
+    # ─── Ollama ───────────────────────────────────────────────────────
+
     async def _call_ollama(self, symbol: str, indicators_by_tf: dict, confluence: dict) -> dict:
         """Call Ollama with structured prompt for trade signal."""
         if ollama_client is None:
@@ -310,7 +354,6 @@ class StrategyAgent(BaseAgent):
             )
 
             content = response["message"]["content"].strip()
-            # Try to extract JSON from response
             # Handle markdown code blocks
             if "```" in content:
                 content = content.split("```")[1]
@@ -318,7 +361,7 @@ class StrategyAgent(BaseAgent):
                     content = content[4:]
                 content = content.strip()
 
-            # Find the first { and last } to capture the full JSON object
+            # Extract JSON object
             first_brace = content.find("{")
             last_brace = content.rfind("}")
             if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
@@ -326,15 +369,12 @@ class StrategyAgent(BaseAgent):
 
             # Clean up common Ollama issues
             import re
-            # Remove single-line comments (// ...)
             content = re.sub(r'//[^\n]*', '', content)
-            # Remove trailing commas before } or ]
             content = re.sub(r',\s*([}\]])', r'\1', content)
 
             try:
                 signal = json.loads(content)
             except json.JSONDecodeError:
-                # Last resort: try to extract key fields with regex
                 action_match = re.search(r'"action"\s*:\s*"(\w+)"', content)
                 conf_match = re.search(r'"confidence"\s*:\s*([\d.]+)', content)
                 entry_match = re.search(r'"entry_price"\s*:\s*([\d.]+)', content)
@@ -354,6 +394,7 @@ class StrategyAgent(BaseAgent):
                 else:
                     logger.warning(f"Ollama raw content for {symbol}: {content[:200]}")
                     raise
+
             logger.info(f"Ollama signal for {symbol}: {signal.get('action')} (conf: {signal.get('confidence')})")
             return signal
 
@@ -364,42 +405,41 @@ class StrategyAgent(BaseAgent):
             logger.warning(f"Ollama error for {symbol}: {e}")
             return {"action": "HOLD", "reasoning": f"Ollama error: {str(e)[:100]}"}
 
-    async def _analyze_symbol(self, symbol: str, data_by_tf: dict):
-        """Run full analysis on a symbol with all timeframe data."""
+    # ─── Analysis ─────────────────────────────────────────────────────
+
+    async def _analyze_symbol(self, symbol: str, data_by_tf: dict[str, pd.DataFrame]):
+        """Run full analysis on a symbol. data_by_tf maps tf → DataFrame."""
         indicators_by_tf = {}
-        for tf, bars_dict in data_by_tf.items():
-            if bars_dict:
-                try:
-                    df = pd.DataFrame(bars_dict)
-                    indicators_by_tf[tf] = self._compute_indicators(df)
-                except Exception as e:
-                    logger.warning(f"Error building df for {symbol} {tf}: {e}")
-                    indicators_by_tf[tf] = {}
+        for tf, df in data_by_tf.items():
+            if df is not None and not df.empty:
+                indicators_by_tf[tf] = self._compute_indicators(df)
             else:
                 indicators_by_tf[tf] = {}
 
         confluence = self._compute_confluence(indicators_by_tf)
+        conf_score = confluence.get("score", 0)
+
+        logger.debug(
+            f"{symbol}: confluence score={conf_score:.2f} "
+            f"(bull={confluence['bull_count']} bear={confluence['bear_count']})"
+        )
+
+        # Skip Ollama entirely when confluence is too mixed — save ~15s per dead symbol
+        if abs(conf_score) < 0.15:
+            logger.info(f"{symbol}: SKIP Ollama — confluence too mixed (score={conf_score:.2f})")
+            return
+
         signal = await self._call_ollama(symbol, indicators_by_tf, confluence)
 
         action = signal.get("action", "HOLD").upper()
         confidence = float(signal.get("confidence", 0))
 
         # Confluence direction filter: veto Ollama if confluence disagrees
-        conf_score = confluence.get("score", 0)
         if action == "BUY" and conf_score < 0:
-            logger.info(
-                f"{symbol}: BUY vetoed — confluence bearish (score={conf_score:.2f})"
-            )
+            logger.info(f"{symbol}: BUY vetoed — confluence bearish (score={conf_score:.2f})")
             action = "HOLD"
         elif action == "SELL" and conf_score > 0:
-            logger.info(
-                f"{symbol}: SELL vetoed — confluence bullish (score={conf_score:.2f})"
-            )
-            action = "HOLD"
-        elif action != "HOLD" and abs(conf_score) < 0.15:
-            logger.info(
-                f"{symbol}: {action} vetoed — confluence too mixed (score={conf_score:.2f})"
-            )
+            logger.info(f"{symbol}: SELL vetoed — confluence bullish (score={conf_score:.2f})")
             action = "HOLD"
 
         if action != "HOLD" and confidence >= self.confidence_threshold:
@@ -416,7 +456,6 @@ class StrategyAgent(BaseAgent):
             except (TypeError, ValueError):
                 entry_price = 0
 
-            # Get last_price from indicators as fallback
             if not entry_price or entry_price <= 0:
                 for tf in ["1m", "5m", "15m"]:
                     ind = indicators_by_tf.get(tf, {})
@@ -440,15 +479,15 @@ class StrategyAgent(BaseAgent):
 
             if not stop_loss or stop_loss <= 0:
                 if action == "BUY":
-                    stop_loss = round(entry_price * 0.995, 2)  # 0.5% below
+                    stop_loss = round(entry_price * 0.995, 2)
                 else:
-                    stop_loss = round(entry_price * 1.005, 2)  # 0.5% above
+                    stop_loss = round(entry_price * 1.005, 2)
 
             if not take_profit or take_profit <= 0:
                 if action == "BUY":
-                    take_profit = round(entry_price * 1.01, 2)  # 1% above
+                    take_profit = round(entry_price * 1.01, 2)
                 else:
-                    take_profit = round(entry_price * 0.99, 2)  # 1% below
+                    take_profit = round(entry_price * 0.99, 2)
 
             logger.info(f"Trade signal: {action} {symbol} (confidence: {confidence})")
             self.send("RiskAgent", "trade_signal", {
@@ -464,33 +503,13 @@ class StrategyAgent(BaseAgent):
                 "indicators_bearish": signal.get("indicators_bearish", []),
             })
 
+    # ─── Message Handling ─────────────────────────────────────────────
+
     async def handle_message(self, message: Message):
         msg_type = message.type
         payload = message.payload
 
-        if msg_type == "data_response":
-            symbol = payload.get("symbol")
-            timeframe = payload.get("timeframe")
-            request_id = payload.get("request_id", "")
-
-            if symbol not in self._pending_data:
-                self._pending_data[symbol] = {}
-
-            self._pending_data[symbol][timeframe] = payload.get("bars", {})
-
-            # Check if we have all 3 timeframes — queue for analysis
-            if len(self._pending_data[symbol]) >= 3:
-                data = self._pending_data.pop(symbol)
-                self._ready_queue.append((symbol, data))
-
-                # When we have a batch of 4 (or all remaining), analyze in parallel
-                if len(self._ready_queue) >= 4 or len(self._pending_data) == 0:
-                    batch = self._ready_queue[:4]
-                    self._ready_queue = self._ready_queue[4:]
-                    tasks = [self._analyze_symbol(sym, d) for sym, d in batch]
-                    await asyncio.gather(*tasks, return_exceptions=True)
-
-        elif msg_type == "cool_down_response":
+        if msg_type == "cool_down_response":
             symbol = payload.get("symbol")
             is_cooled = payload.get("cooled_down", False)
             self._cool_downs[symbol] = is_cooled
@@ -498,7 +517,9 @@ class StrategyAgent(BaseAgent):
         elif msg_type == "force_scan":
             symbol = payload.get("symbol")
             if symbol:
-                await self._request_data_and_analyze(symbol)
+                data_by_tf = await self._fetch_yfinance_data(symbol)
+                if data_by_tf:
+                    await self._analyze_symbol(symbol, data_by_tf)
             else:
                 await self._scan_all_symbols()
 
