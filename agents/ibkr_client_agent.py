@@ -86,9 +86,21 @@ class IBKRClientAgent(BaseAgent):
         # 10349 = TIF warning (informational, not critical)
         elif errorCode == 10349:
             pass  # Already handled
-        # 201 = Order rejected (already handled in _on_order_status)
+        # 201 = Order rejected
         elif errorCode == 201:
-            pass
+            if "Pattern Day Trader" in errorString or "PDT" in errorString:
+                symbol = getattr(contract, "symbol", "???") if contract else "???"
+                logger.warning(f"PDT rejection on {symbol}: {errorString}")
+                self.broadcast("pause", {})
+                logger.warning("Auto-paused trading due to PDT rejection")
+                self.broadcast("order_rejected", {
+                    "symbol": symbol,
+                    "order_id": reqId,
+                    "reason": (
+                        "PDT rule: Account flagged as Pattern Day Trader (under $25k). "
+                        "In IB, switch your account to Cash type to bypass PDT restrictions."
+                    ),
+                })
         # Log other errors
         elif errorCode not in (2104, 2106, 2158, 2119):  # Skip info/connection msgs
             symbol = getattr(contract, 'symbol', '') if contract else ''

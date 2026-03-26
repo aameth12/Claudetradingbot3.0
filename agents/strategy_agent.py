@@ -260,18 +260,24 @@ class StrategyAgent(BaseAgent):
                 break
 
         system_prompt = (
-            "You are a professional day trader AI. Analyze the technical indicators "
-            "and give a trading signal. " + direction_rules + "\n\n"
-            "Rules:\n"
-            "- BUY = open LONG when momentum and trend are bullish\n"
-            "- SELL = open SHORT when momentum and trend are bearish\n"
-            "- HOLD = when signals are mixed or no clear edge\n"
+            "You are a professional day trader AI. Your PRIMARY job is to avoid bad trades.\n"
+            "HOLD is the correct answer whenever signals are mixed, weak, or inconclusive.\n"
+            + direction_rules + "\n\n"
+            "Criteria for each action:\n"
+            "- BUY: RSI<50 AND EMA9>EMA21 AND MACD histogram positive AND volume supports move\n"
+            "- SELL: RSI>50 AND EMA9<EMA21 AND MACD histogram negative AND volume supports move\n"
+            "- HOLD: ANY of the above criteria fail, signals conflict, or edge is unclear\n\n"
+            "Price rules:\n"
+            "- entry_price MUST equal the current price exactly (do not invent a price)\n"
             "- For BUY: stop_loss < entry_price, take_profit > entry_price\n"
             "- For SELL: stop_loss > entry_price, take_profit < entry_price\n"
-            "- IMPORTANT: entry_price MUST be set to the current price\n"
-            "- stop_loss: 0.3-1% from entry, take_profit: 0.6-2% from entry\n"
-            "- confidence: 0.0-0.5 = weak signal, 0.5-0.7 = moderate, 0.7-1.0 = strong\n"
-            "- Only give confidence > 0.7 when multiple indicators strongly agree\n\n"
+            "- stop_loss: 0.3-1% from entry_price\n"
+            "- take_profit: at least 2x the stop_loss distance from entry_price\n\n"
+            "Confidence rules:\n"
+            "- confidence < 0.65 → always return HOLD regardless of action\n"
+            "- confidence 0.65-0.75 → moderate conviction, only trade if all criteria met\n"
+            "- confidence > 0.75 → strong conviction, 4+ indicators must agree\n"
+            "- Expected distribution: ~70% HOLD, ~15% BUY, ~15% SELL\n\n"
             "Respond ONLY with valid JSON, no markdown, no extra text."
         )
 
@@ -377,6 +383,24 @@ class StrategyAgent(BaseAgent):
 
         action = signal.get("action", "HOLD").upper()
         confidence = float(signal.get("confidence", 0))
+
+        # Confluence direction filter: veto Ollama if confluence disagrees
+        conf_score = confluence.get("score", 0)
+        if action == "BUY" and conf_score < 0:
+            logger.info(
+                f"{symbol}: BUY vetoed — confluence bearish (score={conf_score:.2f})"
+            )
+            action = "HOLD"
+        elif action == "SELL" and conf_score > 0:
+            logger.info(
+                f"{symbol}: SELL vetoed — confluence bullish (score={conf_score:.2f})"
+            )
+            action = "HOLD"
+        elif action != "HOLD" and abs(conf_score) < 0.15:
+            logger.info(
+                f"{symbol}: {action} vetoed — confluence too mixed (score={conf_score:.2f})"
+            )
+            action = "HOLD"
 
         if action != "HOLD" and confidence >= self.confidence_threshold:
             # Direction filter

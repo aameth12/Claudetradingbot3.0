@@ -1,6 +1,8 @@
 """Entry point for the AI Multi-Agent Day Trading Bot."""
 
 import asyncio
+import atexit
+import os
 import sys
 
 import yaml
@@ -8,6 +10,31 @@ from dotenv import load_dotenv
 from loguru import logger
 
 from utils.logger import setup_logger
+
+_LOCK_FILE = "bot.lock"
+
+
+def _acquire_lock():
+    """Prevent multiple simultaneous bot instances (avoids Telegram Conflict errors)."""
+    if os.path.exists(_LOCK_FILE):
+        try:
+            with open(_LOCK_FILE) as f:
+                pid = int(f.read().strip())
+            # Check if the PID is still alive
+            os.kill(pid, 0)
+            logger.error(
+                f"Another bot instance is already running (PID {pid}). "
+                "Stop it first or delete bot.lock if it crashed."
+            )
+            sys.exit(1)
+        except (ValueError, OSError):
+            # Process no longer exists — stale lock, overwrite it
+            pass
+
+    with open(_LOCK_FILE, "w") as f:
+        f.write(str(os.getpid()))
+
+    atexit.register(lambda: os.unlink(_LOCK_FILE) if os.path.exists(_LOCK_FILE) else None)
 
 
 def load_config(path: str = "config.yaml") -> dict:
@@ -21,6 +48,9 @@ def load_config(path: str = "config.yaml") -> dict:
 
 
 def main():
+    # Prevent multiple instances (avoids Telegram Conflict errors)
+    _acquire_lock()
+
     # Windows asyncio policy
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
