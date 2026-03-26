@@ -190,10 +190,23 @@ class IBKRClientAgent(BaseAgent):
                     symbol = info.get("symbol", "???")
                     logger.warning(f"Parent order CANCELLED (orderId={order_id}) for {symbol}")
                     info["resolved"] = True
+
+                    # Check if this is a PDT rejection from the trade log
+                    log_entries = getattr(trade, 'log', [])
+                    reason = "Parent order cancelled by broker"
+                    for log_entry in log_entries:
+                        msg = getattr(log_entry, 'message', '')
+                        if 'Pattern Day Trader' in msg or 'PDT' in msg:
+                            reason = "PDT rule: Account under $25k. Switch to Cash account in IB to bypass."
+                            # Auto-pause to stop further rejected orders
+                            self.broadcast("pause", {})
+                            logger.warning("Auto-paused trading due to PDT rejection")
+                            break
+
                     self.broadcast("order_rejected", {
                         "symbol": symbol,
                         "order_id": order_id,
-                        "reason": "Parent order cancelled by broker",
+                        "reason": reason,
                     })
                     break
         except Exception as e:
