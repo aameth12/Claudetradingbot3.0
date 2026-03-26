@@ -303,15 +303,42 @@ class StrategyAgent(BaseAgent):
                     content = content[4:]
                 content = content.strip()
 
-            # Try to find JSON object in the response text (handles nested braces)
-            import re
             # Find the first { and last } to capture the full JSON object
             first_brace = content.find("{")
             last_brace = content.rfind("}")
             if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
                 content = content[first_brace:last_brace + 1]
 
-            signal = json.loads(content)
+            # Clean up common Ollama issues
+            import re
+            # Remove single-line comments (// ...)
+            content = re.sub(r'//[^\n]*', '', content)
+            # Remove trailing commas before } or ]
+            content = re.sub(r',\s*([}\]])', r'\1', content)
+
+            try:
+                signal = json.loads(content)
+            except json.JSONDecodeError:
+                # Last resort: try to extract key fields with regex
+                action_match = re.search(r'"action"\s*:\s*"(\w+)"', content)
+                conf_match = re.search(r'"confidence"\s*:\s*([\d.]+)', content)
+                entry_match = re.search(r'"entry_price"\s*:\s*([\d.]+)', content)
+                sl_match = re.search(r'"stop_loss"\s*:\s*([\d.]+)', content)
+                tp_match = re.search(r'"take_profit"\s*:\s*([\d.]+)', content)
+                reason_match = re.search(r'"reasoning"\s*:\s*"([^"]*)"', content)
+
+                if action_match:
+                    signal = {
+                        "action": action_match.group(1),
+                        "confidence": float(conf_match.group(1)) if conf_match else 0.0,
+                        "entry_price": float(entry_match.group(1)) if entry_match else 0.0,
+                        "stop_loss": float(sl_match.group(1)) if sl_match else 0.0,
+                        "take_profit": float(tp_match.group(1)) if tp_match else 0.0,
+                        "reasoning": reason_match.group(1) if reason_match else "Parsed from malformed JSON",
+                    }
+                else:
+                    logger.warning(f"Ollama raw content for {symbol}: {content[:200]}")
+                    raise
             logger.info(f"Ollama signal for {symbol}: {signal.get('action')} (conf: {signal.get('confidence')})")
             return signal
 
