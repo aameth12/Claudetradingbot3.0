@@ -36,6 +36,7 @@ class IBKRClientAgent(BaseAgent):
         self._active_orders: dict[int, dict] = {}
         self._bracket_groups: dict[int, dict] = {}
         self._acct_summary_reqid = None
+        self._failed_symbols: set[str] = set()
 
     async def run(self):
         """Main loop: connect, subscribe events, poll account."""
@@ -45,6 +46,7 @@ class IBKRClientAgent(BaseAgent):
             self.ib.orderStatusEvent += self._on_order_status
             self.ib.newOrderEvent += self._on_new_order
             self.ib.disconnectedEvent += self._on_disconnect
+            self.ib.errorEvent += self._on_error
 
             asyncio.ensure_future(self._account_poll_loop())
 
@@ -71,6 +73,27 @@ class IBKRClientAgent(BaseAgent):
         logger.error("Failed to connect to IB Gateway after all retries")
         self._connected = False
         self.broadcast("ibkr_disconnect_fatal", {"reason": "All connection attempts failed"})
+
+    def _on_error(self, reqId, errorCode, errorString, contract):
+        """Handle IB error events gracefully."""
+        # 10089 = market data subscription required
+        if errorCode == 10089 and contract:
+            symbol = getattr(contract, 'symbol', '???')
+            if symbol not in self._failed_symbols:
+                self._failed_symbols.add(symbol)
+                logger.warning(f"No market data subscription for {symbol} — removing from subscriptions")
+                self._subscriptions.pop(symbol, None)
+        # 10349 = TIF warning (informational, not critical)
+        elif errorCode == 10349:
+            pass  # Already handled
+        # 201 = Order rejected (already handled in _on_order_status)
+        elif errorCode == 201:
+            pass
+        # Log other errors
+        elif errorCode not in (2104, 2106, 2158, 2119):  # Skip info/connection msgs
+            symbol = getattr(contract, 'symbol', '') if contract else ''
+            logger.warning(f"IB Error {errorCode} (reqId={reqId}): {errorString}" +
+                          (f" [{symbol}]" if symbol else ""))
 
     def _on_disconnect(self):
         """Handle unexpected disconnection."""
@@ -294,10 +317,11 @@ class IBKRClientAgent(BaseAgent):
     async def subscribe_market_data(self, symbols: list[str]):
         """Subscribe to real-time market data for given symbols."""
         for symbol in symbols:
+            if symbol in self._failed_symbols:
+                continue  # Skip symbols without data subscriptions
             if symbol not in self._subscriptions:
                 contract = Stock(symbol, "SMART", "USD")
                 try:
-                    # Use async version to avoid event loop conflict
                     await self.ib.qualifyContractsAsync(contract)
                     self._subscriptions[symbol] = contract
                     self.ib.reqMktData(contract)
