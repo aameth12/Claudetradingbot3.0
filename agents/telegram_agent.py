@@ -598,6 +598,15 @@ class TelegramAgent(BaseAgent):
                     f"{market_note}"
                 )
 
+        elif msg_type == "order_rejected":
+            symbol = payload.get("symbol", "???")
+            reason = payload.get("reason", "Unknown")
+            await self._send(
+                f"\u274c <b>ORDER REJECTED</b>\n"
+                f"Symbol: {symbol}\n"
+                f"Reason: {reason}"
+            )
+
         elif msg_type == "risk_rejection":
             # Silent — don't spam the user with rejections
             pass

@@ -185,6 +185,17 @@ class IBKRClientAgent(BaseAgent):
                 if order_id == parent_id and status == "Filled":
                     logger.info(f"Parent order filled (orderId={order_id}) for {info.get('symbol')}")
                     break
+
+                if order_id == parent_id and status == "Cancelled":
+                    symbol = info.get("symbol", "???")
+                    logger.warning(f"Parent order CANCELLED (orderId={order_id}) for {symbol}")
+                    info["resolved"] = True
+                    self.broadcast("order_rejected", {
+                        "symbol": symbol,
+                        "order_id": order_id,
+                        "reason": "Parent order cancelled by broker",
+                    })
+                    break
         except Exception as e:
             logger.exception(f"Error in _on_order_status: {e}")
 
@@ -365,6 +376,12 @@ class IBKRClientAgent(BaseAgent):
             )
 
             parent_order, tp_order, sl_order = bracket
+
+            # Explicitly set TIF to DAY and outsideRth to False
+            # This prevents IB Gateway order presets from interfering
+            for order in [parent_order, tp_order, sl_order]:
+                order.tif = "DAY"
+                order.outsideRth = False
 
             trades = []
             for order in [parent_order, tp_order, sl_order]:

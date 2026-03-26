@@ -318,6 +318,15 @@ class ExecutionAgent(BaseAgent):
             # ── Known Gap #2 RESOLVED: Handle position close from bracket child fills ──
             await self._on_position_closed(payload)
 
+        elif msg_type == "order_rejected":
+            # Clean up pending trade that was never filled
+            symbol = payload.get("symbol")
+            if symbol and symbol in self._open_trades:
+                trade = self._open_trades[symbol]
+                if not trade.get("filled"):
+                    del self._open_trades[symbol]
+                    logger.info(f"Cleaned up unfilled trade for {symbol} after rejection")
+
         elif msg_type == "close_position":
             symbol = payload.get("symbol")
             reason = payload.get("reason", "MANUAL")
