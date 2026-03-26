@@ -260,16 +260,18 @@ class StrategyAgent(BaseAgent):
                 break
 
         system_prompt = (
-            "You are an aggressive day trader AI. Analyze technical indicators "
-            "and give a clear trading signal. " + direction_rules + "\n\n"
+            "You are a professional day trader AI. Analyze the technical indicators "
+            "and give a trading signal. " + direction_rules + "\n\n"
             "Rules:\n"
-            "- BUY = open LONG when indicators are bullish (price above EMA, RSI rising, MACD bullish)\n"
-            "- SELL = open SHORT when indicators are bearish (price below EMA, RSI falling, MACD bearish)\n"
-            "- HOLD = only when signals are truly mixed with no clear direction\n"
-            "- Be decisive. If most indicators lean one way, commit to that direction.\n"
+            "- BUY = open LONG when momentum and trend are bullish\n"
+            "- SELL = open SHORT when momentum and trend are bearish\n"
+            "- HOLD = when signals are mixed or no clear edge\n"
             "- For BUY: stop_loss < entry_price, take_profit > entry_price\n"
             "- For SELL: stop_loss > entry_price, take_profit < entry_price\n"
-            "- Set entry_price to current price, stop_loss 0.3-1% away, take_profit 0.6-2% away\n\n"
+            "- IMPORTANT: entry_price MUST be set to the current price\n"
+            "- stop_loss: 0.3-1% from entry, take_profit: 0.6-2% from entry\n"
+            "- confidence: 0.0-0.5 = weak signal, 0.5-0.7 = moderate, 0.7-1.0 = strong\n"
+            "- Only give confidence > 0.7 when multiple indicators strongly agree\n\n"
             "Respond ONLY with valid JSON, no markdown, no extra text."
         )
 
@@ -280,10 +282,10 @@ class StrategyAgent(BaseAgent):
             f"5-Minute Indicators: {json.dumps(indicators_by_tf.get('5m', {}))}\n\n"
             f"15-Minute Indicators: {json.dumps(indicators_by_tf.get('15m', {}))}\n\n"
             f"Confluence: {json.dumps(confluence)}\n\n"
-            "Respond with JSON:\n"
+            f"Respond with JSON (entry_price MUST be {last_price}):\n"
             '{"action": "BUY|SELL|HOLD", "confidence": 0.0-1.0, '
             '"reasoning": "max 200 chars", '
-            '"entry_price": <price>, "stop_loss": <price>, "take_profit": <price>, '
+            f'"entry_price": {last_price}, "stop_loss": <price>, "take_profit": <price>, '
             '"timeframe": "scalp|intraday", '
             '"indicators_bullish": [...], "indicators_bearish": [...]}'
         )
@@ -383,14 +385,55 @@ class StrategyAgent(BaseAgent):
             if action == "SELL" and not self.allow_shorts:
                 return
 
+            # Ensure entry_price is valid — fallback to current market price
+            entry_price = signal.get("entry_price")
+            try:
+                entry_price = float(entry_price)
+            except (TypeError, ValueError):
+                entry_price = 0
+
+            # Get last_price from indicators as fallback
+            if not entry_price or entry_price <= 0:
+                for tf in ["1m", "5m", "15m"]:
+                    ind = indicators_by_tf.get(tf, {})
+                    if "last_close" in ind:
+                        entry_price = ind["last_close"]
+                        break
+
+            if not entry_price or entry_price <= 0:
+                logger.warning(f"No valid entry price for {symbol}, skipping")
+                return
+
+            # Auto-calculate SL/TP if Ollama didn't provide valid ones
+            stop_loss = signal.get("stop_loss")
+            take_profit = signal.get("take_profit")
+            try:
+                stop_loss = float(stop_loss) if stop_loss else 0
+                take_profit = float(take_profit) if take_profit else 0
+            except (TypeError, ValueError):
+                stop_loss = 0
+                take_profit = 0
+
+            if not stop_loss or stop_loss <= 0:
+                if action == "BUY":
+                    stop_loss = round(entry_price * 0.995, 2)  # 0.5% below
+                else:
+                    stop_loss = round(entry_price * 1.005, 2)  # 0.5% above
+
+            if not take_profit or take_profit <= 0:
+                if action == "BUY":
+                    take_profit = round(entry_price * 1.01, 2)  # 1% above
+                else:
+                    take_profit = round(entry_price * 0.99, 2)  # 1% below
+
             logger.info(f"Trade signal: {action} {symbol} (confidence: {confidence})")
             self.send("RiskAgent", "trade_signal", {
                 "symbol": symbol,
                 "action": action,
                 "confidence": confidence,
-                "entry_price": signal.get("entry_price"),
-                "stop_loss": signal.get("stop_loss"),
-                "take_profit": signal.get("take_profit"),
+                "entry_price": entry_price,
+                "stop_loss": stop_loss,
+                "take_profit": take_profit,
                 "timeframe": signal.get("timeframe", "intraday"),
                 "reasoning": signal.get("reasoning", ""),
                 "indicators_bullish": signal.get("indicators_bullish", []),
