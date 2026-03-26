@@ -70,13 +70,6 @@ class RiskAgent(BaseAgent):
         if self._daily_loss_halt:
             return False, "Daily loss limit reached", signal
 
-        # 2b. PDT PROTECTION: max 3 day trades per day when NAV < $25,000
-        if self._nav < 25000 and self._day_trades_today >= 3:
-            return False, (
-                f"PDT limit: {self._day_trades_today} day trades used today "
-                "(max 3 for accounts under $25k). Wait until tomorrow or deposit funds."
-            ), signal
-
         total_pnl = self._realized_pnl + self._unrealized_pnl
         max_loss = self._nav * self.max_daily_loss_pct
         if total_pnl < -max_loss:

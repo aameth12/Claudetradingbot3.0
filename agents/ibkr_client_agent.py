@@ -106,8 +106,9 @@ class IBKRClientAgent(BaseAgent):
                         "symbol": symbol,
                         "order_id": reqId,
                         "reason": (
-                            "PDT rule: Account under $25k equity — Pattern Day Trader restriction. "
-                            "Fix: In IB Client Portal → Account Settings → change to Cash account type."
+                            "PDT rejection on paper account. Fix: IB Client Portal → "
+                            "Settings → Paper Trading Account → Reset → select Cash type. "
+                            "Your real account is unaffected."
                         ),
                     })
         # Log other errors
@@ -242,8 +243,8 @@ class IBKRClientAgent(BaseAgent):
                         msg = getattr(log_entry, 'message', '')
                         if 'Pattern Day Trader' in msg or 'PDT' in msg:
                             reason = (
-                                "PDT rule: Account under $25k equity. "
-                                "Fix: In IB Client Portal → Account Settings → change to Cash account type."
+                                "PDT rejection on paper account. Fix: IB Client Portal → "
+                                "Settings → Paper Trading Account → Reset → select Cash type."
                             )
                             if not self._paused:
                                 self._paused = True
