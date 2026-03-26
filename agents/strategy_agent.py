@@ -34,6 +34,7 @@ class StrategyAgent(BaseAgent):
         self._paused = False
         self._pending_data: dict[str, dict] = {}
         self._cool_downs: dict[str, bool] = {}
+        self._ready_queue: list[tuple[str, dict]] = []
 
     async def run(self):
         """Main loop: scan symbols periodically during market hours."""
@@ -46,22 +47,26 @@ class StrategyAgent(BaseAgent):
             await asyncio.sleep(self.scan_interval)
 
     async def _scan_all_symbols(self):
-        """Scan each watchlist symbol for trade signals."""
+        """Scan each watchlist symbol — request data for all, then analyze in parallel."""
         logger.info("Starting strategy scan cycle")
+
+        # Request data for all symbols at once
+        symbols_to_scan = []
         for symbol in self.watchlist:
             if self._paused:
-                break
-
-            # Check cool-down
+                return
             if self._cool_downs.get(symbol, False):
                 logger.debug(f"Skipping {symbol} — cooled down")
                 continue
-
-            # Check cool-down with PerformanceAgent
             self.send("PerformanceAgent", "check_cool_down", {"symbol": symbol})
+            symbols_to_scan.append(symbol)
 
+        # Fire all data requests at once (non-blocking)
+        for symbol in symbols_to_scan:
             await self._request_data_and_analyze(symbol)
-            await asyncio.sleep(2)  # Rate limit between symbols
+
+        # Data responses arrive via handle_message and trigger _analyze_symbol
+        # The Ollama calls will be queued as data comes in
 
     async def _request_data_and_analyze(self, symbol: str):
         """Request data from DataAgent and run analysis."""
@@ -255,15 +260,17 @@ class StrategyAgent(BaseAgent):
                 break
 
         system_prompt = (
-            "You are a professional day trader AI. Analyze the provided technical indicators "
-            "and give a trading signal. " + direction_rules + "\n\n"
+            "You are an aggressive day trader AI. Analyze technical indicators "
+            "and give a clear trading signal. " + direction_rules + "\n\n"
             "Rules:\n"
-            "- BUY means open a LONG position\n"
-            "- SELL means open a SHORT position\n"
-            "- HOLD means do nothing\n"
+            "- BUY = open LONG when indicators are bullish (price above EMA, RSI rising, MACD bullish)\n"
+            "- SELL = open SHORT when indicators are bearish (price below EMA, RSI falling, MACD bearish)\n"
+            "- HOLD = only when signals are truly mixed with no clear direction\n"
+            "- Be decisive. If most indicators lean one way, commit to that direction.\n"
             "- For BUY: stop_loss < entry_price, take_profit > entry_price\n"
-            "- For SELL: stop_loss > entry_price, take_profit < entry_price\n\n"
-            "Respond ONLY with valid JSON, no markdown, no explanation outside JSON."
+            "- For SELL: stop_loss > entry_price, take_profit < entry_price\n"
+            "- Set entry_price to current price, stop_loss 0.3-1% away, take_profit 0.6-2% away\n\n"
+            "Respond ONLY with valid JSON, no markdown, no extra text."
         )
 
         user_prompt = (
@@ -404,10 +411,17 @@ class StrategyAgent(BaseAgent):
 
             self._pending_data[symbol][timeframe] = payload.get("bars", {})
 
-            # Check if we have all 3 timeframes
+            # Check if we have all 3 timeframes — queue for analysis
             if len(self._pending_data[symbol]) >= 3:
                 data = self._pending_data.pop(symbol)
-                await self._analyze_symbol(symbol, data)
+                self._ready_queue.append((symbol, data))
+
+                # When we have a batch of 4 (or all remaining), analyze in parallel
+                if len(self._ready_queue) >= 4 or len(self._pending_data) == 0:
+                    batch = self._ready_queue[:4]
+                    self._ready_queue = self._ready_queue[4:]
+                    tasks = [self._analyze_symbol(sym, d) for sym, d in batch]
+                    await asyncio.gather(*tasks, return_exceptions=True)
 
         elif msg_type == "cool_down_response":
             symbol = payload.get("symbol")
