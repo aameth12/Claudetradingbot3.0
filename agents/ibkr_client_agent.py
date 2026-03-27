@@ -300,25 +300,19 @@ class IBKRClientAgent(BaseAgent):
             await asyncio.sleep(30)
 
     async def _poll_account(self):
-        """Fetch account and position data from IB."""
+        """Fetch account and position data from IB using reqAccountSummaryAsync for fresh data."""
         try:
-            accounts = self.ib.managedAccounts()
-            if not accounts:
-                return
-            account_id = accounts[0]  # noqa: F841 — kept for logging context
-
-            # Account updates are subscribed once in _connect().
-            # Here we just read ib_insync's cached values.
-            # Read all cached values — do NOT filter by account_id here;
-            # ib_insync stores values differently in paper vs live accounts
-            account_values = self.ib.accountValues()
+            # reqAccountSummaryAsync explicitly requests fresh account data from IB
+            # (unlike accountValues() which only reads the cached push-subscription data
+            # and returns nothing if the cache hasn't been populated yet)
+            summary = await self.ib.reqAccountSummaryAsync()
 
             nav = 0.0
             buying_power = 0.0
             realized_pnl = 0.0
             unrealized_pnl = 0.0
 
-            for av in account_values:
+            for av in summary:
                 tag = av.tag
                 cur = av.currency
                 try:
@@ -334,9 +328,9 @@ class IBKRClientAgent(BaseAgent):
                 elif tag == "UnrealizedPnL" and cur == "USD":
                     unrealized_pnl = val
 
-            # Fallback: if nav still 0, try TotalCashBalance + portfolio value
+            # Fallback: EquityWithLoanValue if NetLiquidation not present
             if nav == 0:
-                for av in account_values:
+                for av in summary:
                     if av.tag == "EquityWithLoanValue" and av.currency == "USD":
                         try:
                             nav = float(av.value)
@@ -367,6 +361,7 @@ class IBKRClientAgent(BaseAgent):
 
             if nav > 0:
                 self.broadcast("account_update", self._account_data)
+                logger.debug(f"Account poll: NAV=${nav:,.2f}, BP=${buying_power:,.2f}")
             else:
                 logger.debug("Account poll: NAV still 0, skipping broadcast")
         except Exception as e:

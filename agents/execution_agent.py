@@ -15,7 +15,7 @@ from loguru import logger
 
 from agents.base_agent import BaseAgent, Message
 from db import database as db
-from utils.helpers import format_currency, format_pct, pnl_emoji
+from utils.helpers import format_currency, format_pct, is_market_open, pnl_emoji
 
 
 def _parse_naive_dt(value: str) -> "datetime | None":
@@ -400,6 +400,17 @@ class ExecutionAgent(BaseAgent):
                     f"Ignoring duplicate approved_order for {symbol} — already "
                     f"{'filled' if existing.get('filled') else 'pending'}"
                 )
+                return
+
+            # Market hours guard: don't place DAY orders when exchange is closed
+            if not is_market_open():
+                logger.warning(f"Market is closed — skipping order for {symbol}")
+                self.send("TelegramAgent", "send_message", {
+                    "text": (
+                        f"\u23f0 <b>Market closed</b> — skipped {payload.get('action','BUY')} "
+                        f"signal for {symbol}. Will re-scan next session."
+                    )
+                })
                 return
 
             self._open_trades[symbol] = {

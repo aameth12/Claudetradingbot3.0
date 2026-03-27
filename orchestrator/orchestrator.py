@@ -165,6 +165,27 @@ class Orchestrator:
                         except Exception:
                             pass
 
+                # Reconcile IBKR positions with bot-tracked trades
+                # If IB has a position the bot doesn't know about, restore it
+                try:
+                    ibkr_positions = self.ibkr_agent.ib.positions()
+                    tracked = set(self.execution_agent._open_trades.keys())
+                    untracked = [
+                        {"symbol": p.contract.symbol, "quantity": int(p.position), "avg_cost": p.avgCost}
+                        for p in ibkr_positions
+                        if p.position != 0 and p.contract.symbol not in tracked
+                    ]
+                    if untracked:
+                        logger.info(f"Reconciler: found {len(untracked)} untracked IBKR position(s): {[u['symbol'] for u in untracked]}")
+                        await self.execution_agent.inbox.put(Message(
+                            sender="Orchestrator",
+                            recipient="ExecutionAgent",
+                            type="ibkr_reconnected",
+                            payload={"open_positions": untracked},
+                        ))
+                except Exception as rec_e:
+                    logger.debug(f"Position reconcile error: {rec_e}")
+
                 # Get positions summary
                 positions = self.execution_agent.get_open_positions_summary(market_data)
 

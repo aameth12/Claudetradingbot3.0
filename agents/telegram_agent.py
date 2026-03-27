@@ -1,6 +1,7 @@
 """TelegramAgent — Telegram bot interface, commands, and proactive alerts."""
 
 import asyncio
+import html as html_lib
 import os
 import subprocess
 import sys
@@ -623,7 +624,7 @@ class TelegramAgent(BaseAgent):
         elif msg_type == "ibkr_disconnect_fatal":
             await self._send(
                 f"\U0001f6a8 <b>IB Gateway FATAL DISCONNECT</b>\n"
-                f"Reason: {payload.get('reason', 'Unknown')}"
+                f"Reason: {html_lib.escape(str(payload.get('reason', 'Unknown')))}"
             )
 
         elif msg_type == "goal_hit":
@@ -638,7 +639,7 @@ class TelegramAgent(BaseAgent):
         elif msg_type == "confidence_adjusted":
             old_val = payload.get("old", 0)
             new_val = payload.get("new", 0)
-            reason = payload.get("reason", "")
+            reason = html_lib.escape(payload.get("reason", ""))
             await self._send(
                 f"\U0001f527 <b>Confidence threshold adjusted</b>\n"
                 f"{old_val:.2f} \u2192 {new_val:.2f}\n"
@@ -676,8 +677,8 @@ class TelegramAgent(BaseAgent):
                 )
 
         elif msg_type == "order_rejected":
-            symbol = payload.get("symbol", "???")
-            reason = payload.get("reason", "Unknown")
+            symbol = html_lib.escape(str(payload.get("symbol", "???")))
+            reason = html_lib.escape(str(payload.get("reason", "Unknown")))
             await self._send(
                 f"\u274c <b>ORDER REJECTED</b>\n"
                 f"Symbol: {symbol}\n"
