@@ -264,7 +264,12 @@ class ExecutionAgent(BaseAgent):
                     held_minutes = (now - entry_dt).total_seconds() / 60
 
                     if held_minutes >= self.max_hold_minutes:
+                        # Skip if close already in flight (prevents duplicate orders every 30s)
+                        if trade.get("_closing"):
+                            logger.debug(f"{symbol} close already in flight, skipping")
+                            continue
                         logger.info(f"Auto-closing {symbol} — held {held_minutes:.0f}m (max {self.max_hold_minutes}m)")
+                        trade["_closing"] = True
                         await self.close_position(symbol, "EOD")
                 except Exception as e:
                     logger.warning(f"Error checking hold time for {symbol}: {e}")
@@ -485,6 +490,18 @@ class ExecutionAgent(BaseAgent):
             open_positions = payload.get("open_positions", [])
             if open_positions:
                 await self._restore_positions(open_positions)
+
+        elif msg_type == "close_position_response":
+            symbol = payload.get("symbol")
+            success = payload.get("success")
+            reason = payload.get("reason", "")
+            if not success and symbol and symbol in self._open_trades:
+                # IBKR says no open position (already closed or 0 shares) — clean up tracking
+                logger.warning(
+                    f"close_position_response: no IBKR position for {symbol} "
+                    f"(reason={reason}) — removing from open_trades"
+                )
+                self._open_trades.pop(symbol, None)
 
         elif msg_type == "bracket_order_response":
             result = payload.get("result")
