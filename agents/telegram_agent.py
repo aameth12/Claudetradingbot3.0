@@ -206,47 +206,47 @@ class TelegramAgent(BaseAgent):
             )
             branch = branch_result.stdout.strip() or "main"
 
-            # Fetch latest from remote
+            # Fetch latest from remote (ignore errors — might be offline)
             fetch = subprocess.run(
                 ["git", "fetch", "origin", branch],
                 cwd=bot_dir, capture_output=True, text=True, timeout=30,
             )
-            if fetch.returncode != 0:
-                err = (fetch.stdout + fetch.stderr).strip()
-                await update.message.reply_text(
-                    f"\u274c Fetch failed:\n<pre>{err[:800]}</pre>", parse_mode="HTML"
-                )
-                return
 
-            # Check if we're behind
+            # Count how many new commits are on the remote
             behind = subprocess.run(
                 ["git", "rev-list", f"HEAD..origin/{branch}", "--count"],
                 cwd=bot_dir, capture_output=True, text=True, timeout=10,
             )
-            commits_behind = int(behind.stdout.strip() or "0")
+            commits_behind = int(behind.stdout.strip() or "0") if behind.returncode == 0 else 0
 
-            if commits_behind == 0:
-                await update.message.reply_text(
-                    f"\u2705 Already up to date ({branch}). No changes.",
-                    parse_mode="HTML",
+            # If remote has new commits, reset to them
+            if commits_behind > 0:
+                reset = subprocess.run(
+                    ["git", "reset", "--hard", f"origin/{branch}"],
+                    cwd=bot_dir, capture_output=True, text=True, timeout=30,
                 )
-                return
+                if reset.returncode != 0:
+                    err = (reset.stdout + reset.stderr).strip()
+                    await update.message.reply_text(
+                        f"\u274c Update failed:\n<pre>{err[:800]}</pre>", parse_mode="HTML"
+                    )
+                    return
+                status_msg = f"\u2705 {commits_behind} new commit(s) pulled."
+            else:
+                status_msg = "\u2139\ufe0f Already on latest commit."
 
-            # Hard-reset to remote (ensures clean update even if local changes exist)
-            reset = subprocess.run(
-                ["git", "reset", "--hard", f"origin/{branch}"],
-                cwd=bot_dir, capture_output=True, text=True, timeout=30,
+            # Get current commit hash for reference
+            head = subprocess.run(
+                ["git", "log", "-1", "--format=%h %s"],
+                cwd=bot_dir, capture_output=True, text=True, timeout=5,
             )
-            if reset.returncode != 0:
-                err = (reset.stdout + reset.stderr).strip()
-                await update.message.reply_text(
-                    f"\u274c Update failed:\n<pre>{err[:800]}</pre>", parse_mode="HTML"
-                )
-                return
+            commit_info = head.stdout.strip()
 
             await update.message.reply_text(
-                f"\u2705 Updated ({branch}) — {commits_behind} new commit(s).\n"
-                "\U0001f504 Restarting bot...",
+                f"{status_msg}\n"
+                f"Branch: <code>{branch}</code>\n"
+                f"Commit: <code>{commit_info[:80]}</code>\n\n"
+                "\U0001f504 Restarting bot to apply latest code...",
                 parse_mode="HTML",
             )
 
@@ -255,7 +255,7 @@ class TelegramAgent(BaseAgent):
             if os.path.exists(lock_file):
                 os.unlink(lock_file)
 
-            # Replace current process with fresh instance (imports new code)
+            # Always restart — picks up any code changes (disk or git)
             os.execv(sys.executable, [sys.executable] + sys.argv)
 
         except Exception as e:
