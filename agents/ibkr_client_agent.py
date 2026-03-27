@@ -289,20 +289,20 @@ class IBKRClientAgent(BaseAgent):
             await asyncio.sleep(30)
 
     async def _poll_account(self):
-        """Fetch account and position data from IB using managed accounts."""
+        """Fetch account and position data from IB."""
         try:
-            # Use managedAccounts to get account ID, then request updates
             accounts = self.ib.managedAccounts()
             if not accounts:
                 return
             account_id = accounts[0]
 
-            # Request account values via async wrapper
-            await self.ib.reqAccountUpdatesAsync(account_id)
-            await asyncio.sleep(1)  # Give IB time to send the data
+            # Subscribe to account updates if not already (ib_insync caches after first call)
+            self.ib.reqAccountUpdates(True, account_id)
+            await asyncio.sleep(1.5)  # Give IB time to push data
 
-            # Now read the cached values
-            account_values = self.ib.accountValues(account_id)
+            # Read all cached values — do NOT filter by account_id here;
+            # ib_insync stores values differently in paper vs live accounts
+            account_values = self.ib.accountValues()
 
             nav = 0.0
             buying_power = 0.0
@@ -316,17 +316,26 @@ class IBKRClientAgent(BaseAgent):
                     val = float(av.value)
                 except (ValueError, TypeError):
                     continue
-                if tag in ("NetLiquidation", "NetLiquidationByCurrency") and cur == "USD":
+                if tag == "NetLiquidation" and cur == "USD":
                     nav = val
-                elif tag == "BuyingPower":
+                elif tag == "BuyingPower" and cur == "USD":
                     buying_power = val
                 elif tag == "RealizedPnL" and cur == "USD":
                     realized_pnl = val
                 elif tag == "UnrealizedPnL" and cur == "USD":
                     unrealized_pnl = val
 
+            # Fallback: if nav still 0, try TotalCashBalance + portfolio value
+            if nav == 0:
+                for av in account_values:
+                    if av.tag == "EquityWithLoanValue" and av.currency == "USD":
+                        try:
+                            nav = float(av.value)
+                        except (ValueError, TypeError):
+                            pass
+
             # Read cached positions
-            positions = self.ib.positions(account_id)
+            positions = self.ib.positions()
 
             open_positions = []
             for pos in positions:
@@ -347,7 +356,10 @@ class IBKRClientAgent(BaseAgent):
                 "timestamp": datetime.utcnow().isoformat(),
             }
 
-            self.broadcast("account_update", self._account_data)
+            if nav > 0:
+                self.broadcast("account_update", self._account_data)
+            else:
+                logger.debug("Account poll: NAV still 0, skipping broadcast")
         except Exception as e:
             logger.warning(f"Error polling account: {e}")
 

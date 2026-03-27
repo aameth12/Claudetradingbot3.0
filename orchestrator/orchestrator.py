@@ -140,8 +140,23 @@ class Orchestrator:
                 market_data = {}
                 for symbol in list(self.execution_agent._open_trades.keys()):
                     snapshot = self.ibkr_agent.get_snapshot(symbol)
+                    live_price = None
                     if snapshot:
+                        live_price = snapshot.get("last") or snapshot.get("bid") or snapshot.get("close")
                         market_data[symbol] = snapshot
+
+                    # yfinance fallback when IBKR ticker has no live price
+                    if not live_price:
+                        try:
+                            import yfinance as yf
+                            price = yf.Ticker(symbol).fast_info.last_price
+                            if price and price == price:  # not NaN
+                                market_data[symbol] = {
+                                    "last": float(price), "bid": None,
+                                    "ask": None, "close": float(price),
+                                }
+                        except Exception:
+                            pass
 
                 # Get positions summary
                 positions = self.execution_agent.get_open_positions_summary(market_data)

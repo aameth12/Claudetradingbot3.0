@@ -267,7 +267,12 @@ class ExecutionAgent(BaseAgent):
             current_price = entry_price  # Default to entry
 
             if market_data and symbol in market_data:
-                current_price = market_data[symbol].get("last", entry_price) or entry_price
+                snap = market_data[symbol]
+                # Use best available price: last → bid → close → entry fallback
+                current_price = (
+                    snap.get("last") or snap.get("bid") or
+                    snap.get("close") or entry_price
+                )
 
             if direction == "LONG":
                 pnl = (current_price - entry_price) * quantity

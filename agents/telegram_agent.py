@@ -430,9 +430,44 @@ class TelegramAgent(BaseAgent):
             await update.message.reply_text("Usage: /data SYMBOL", parse_mode="HTML")
             return
         symbol = context.args[0].upper()
-        self.send("IBKRClientAgent", "get_snapshot", {"symbol": symbol})
+
+        # Fetch price via yfinance (reliable, no IBKR subscription needed)
+        try:
+            import yfinance as yf
+            loop = asyncio.get_event_loop()
+            info = await loop.run_in_executor(
+                None, lambda: yf.Ticker(symbol).fast_info
+            )
+            price = getattr(info, "last_price", None)
+            day_high = getattr(info, "day_high", None)
+            day_low = getattr(info, "day_low", None)
+            prev_close = getattr(info, "previous_close", None)
+
+            def _f(v):
+                return f"${v:.2f}" if v and v == v else "N/A"
+
+            change = ""
+            if price and prev_close and prev_close > 0:
+                chg = price - prev_close
+                chg_pct = chg / prev_close * 100
+                sign = "+" if chg >= 0 else ""
+                change = f"\nChange: {sign}${chg:.2f} ({sign}{chg_pct:.2f}%)"
+
+            await update.message.reply_text(
+                f"<b>{symbol}</b>{change}\n"
+                f"Price: {_f(price)}\n"
+                f"High: {_f(day_high)} | Low: {_f(day_low)}\n"
+                f"Running AI scan...",
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            await update.message.reply_text(
+                f"<b>{symbol}</b>\nCould not fetch price: {e}\nRunning AI scan...",
+                parse_mode="HTML",
+            )
+
+        # Trigger AI scan (result will come via Telegram alert if signal found)
         self.send("StrategyAgent", "force_scan", {"symbol": symbol})
-        await update.message.reply_text(f"Fetching data for {symbol}...", parse_mode="HTML")
 
     async def _cmd_set(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._auth(update):
