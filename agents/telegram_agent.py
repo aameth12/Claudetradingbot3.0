@@ -202,41 +202,62 @@ class TelegramAgent(BaseAgent):
             # Get current branch name
             branch_result = subprocess.run(
                 ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-                cwd=bot_dir,
-                capture_output=True,
-                text=True,
-                timeout=10,
+                cwd=bot_dir, capture_output=True, text=True, timeout=10,
             )
             branch = branch_result.stdout.strip() or "main"
 
-            # Pull from current branch
-            result = subprocess.run(
-                ["git", "pull", "origin", branch],
-                cwd=bot_dir,
-                capture_output=True,
-                text=True,
-                timeout=30,
+            # Fetch latest from remote
+            fetch = subprocess.run(
+                ["git", "fetch", "origin", branch],
+                cwd=bot_dir, capture_output=True, text=True, timeout=30,
             )
-            output = result.stdout.strip() or result.stderr.strip()
-            if result.returncode == 0:
-                if "Already up to date" in output:
-                    await update.message.reply_text(
-                        f"\u2705 Already up to date ({branch}). No changes.",
-                        parse_mode="HTML",
-                    )
-                else:
-                    await update.message.reply_text(
-                        f"\u2705 Updated ({branch})!\n<pre>{output[:1000]}</pre>\n\n"
-                        "\U0001f504 Restarting bot...",
-                        parse_mode="HTML",
-                    )
-                    # Restart the bot process
-                    os.execv(sys.executable, [sys.executable] + sys.argv)
-            else:
+            if fetch.returncode != 0:
+                err = (fetch.stdout + fetch.stderr).strip()
                 await update.message.reply_text(
-                    f"\u274c Update failed ({branch}):\n<pre>{output[:1000]}</pre>",
+                    f"\u274c Fetch failed:\n<pre>{err[:800]}</pre>", parse_mode="HTML"
+                )
+                return
+
+            # Check if we're behind
+            behind = subprocess.run(
+                ["git", "rev-list", f"HEAD..origin/{branch}", "--count"],
+                cwd=bot_dir, capture_output=True, text=True, timeout=10,
+            )
+            commits_behind = int(behind.stdout.strip() or "0")
+
+            if commits_behind == 0:
+                await update.message.reply_text(
+                    f"\u2705 Already up to date ({branch}). No changes.",
                     parse_mode="HTML",
                 )
+                return
+
+            # Hard-reset to remote (ensures clean update even if local changes exist)
+            reset = subprocess.run(
+                ["git", "reset", "--hard", f"origin/{branch}"],
+                cwd=bot_dir, capture_output=True, text=True, timeout=30,
+            )
+            if reset.returncode != 0:
+                err = (reset.stdout + reset.stderr).strip()
+                await update.message.reply_text(
+                    f"\u274c Update failed:\n<pre>{err[:800]}</pre>", parse_mode="HTML"
+                )
+                return
+
+            await update.message.reply_text(
+                f"\u2705 Updated ({branch}) — {commits_behind} new commit(s).\n"
+                "\U0001f504 Restarting bot...",
+                parse_mode="HTML",
+            )
+
+            # Remove lock file so the restarted process isn't blocked by the stale lock
+            lock_file = os.path.join(bot_dir, "bot.lock")
+            if os.path.exists(lock_file):
+                os.unlink(lock_file)
+
+            # Replace current process with fresh instance (imports new code)
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+
         except Exception as e:
             await update.message.reply_text(
                 f"\u274c Update error: {e}", parse_mode="HTML"
