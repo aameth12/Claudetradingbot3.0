@@ -36,7 +36,7 @@ strategy:
     - 1m
     - 5m
     - 15m
-  allow_shorts: true
+  allow_shorts: false
   allow_longs: true
 
 risk:

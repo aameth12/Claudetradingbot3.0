@@ -64,7 +64,14 @@ class IBKRClientAgent(BaseAgent):
                 await self.ib.connectAsync(self.host, self.port, clientId=self.client_id)
                 self._connected = True
                 logger.info("Connected to IB Gateway successfully")
-                self.broadcast("ibkr_reconnected", {"status": "connected"})
+                # Brief pause so IB Gateway can push initial position data
+                await asyncio.sleep(2)
+                positions = self.ib.positions()
+                open_positions = [
+                    {"symbol": p.contract.symbol, "quantity": int(p.position), "avg_cost": p.avgCost}
+                    for p in positions if p.position != 0
+                ]
+                self.broadcast("ibkr_reconnected", {"status": "connected", "open_positions": open_positions})
                 return
             except Exception as e:
                 logger.warning(f"IB connection attempt {attempt + 1} failed: {e}")
@@ -296,8 +303,8 @@ class IBKRClientAgent(BaseAgent):
                 return
             account_id = accounts[0]
 
-            # Subscribe to account updates if not already (ib_insync caches after first call)
-            self.ib.reqAccountUpdates(True, account_id)
+            # Subscribe to account updates (ib_insync only takes subscribe bool, no acctCode)
+            self.ib.reqAccountUpdates()
             await asyncio.sleep(1.5)  # Give IB time to push data
 
             # Read all cached values — do NOT filter by account_id here;

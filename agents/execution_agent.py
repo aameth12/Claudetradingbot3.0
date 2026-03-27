@@ -242,6 +242,69 @@ class ExecutionAgent(BaseAgent):
                 except Exception as e:
                     logger.warning(f"Error checking hold time for {symbol}: {e}")
 
+    async def _restore_positions(self, ibkr_positions: list[dict]):
+        """
+        On restart: reconcile IBKR live positions with DB open trades.
+        Any symbol that IBKR reports as open AND has a DB record is re-added
+        to _open_trades so the bot can monitor and close them normally.
+        """
+        db_open = await db.get_open_trades()
+        db_by_symbol = {t["symbol"]: t for t in db_open}
+        ibkr_by_symbol = {p["symbol"]: p for p in ibkr_positions}
+
+        restored = 0
+        for symbol, pos in ibkr_by_symbol.items():
+            if symbol in self._open_trades:
+                continue  # Already tracked
+
+            db_trade = db_by_symbol.get(symbol)
+            entry_price = pos["avg_cost"] if pos["avg_cost"] else (db_trade["entry_price"] if db_trade else 0)
+            quantity = abs(pos["quantity"])
+            direction = "LONG" if pos["quantity"] > 0 else "SHORT"
+
+            self._open_trades[symbol] = {
+                "db_id": db_trade["id"] if db_trade else None,
+                "symbol": symbol,
+                "direction": direction,
+                "action": "BUY" if direction == "LONG" else "SELL",
+                "quantity": quantity,
+                "entry_price": entry_price,
+                "stop_loss": db_trade["stop_loss"] if db_trade else 0,
+                "take_profit": db_trade["take_profit"] if db_trade else 0,
+                "risk_dollars": db_trade["risk_dollars"] if db_trade else 0,
+                "reward_dollars": db_trade["reward_dollars"] if db_trade else 0,
+                "confidence": db_trade["confidence"] if db_trade else 0,
+                "reasoning": db_trade["reasoning"] if db_trade else "",
+                "indicators_bullish": [],
+                "indicators_bearish": [],
+                "entry_time": db_trade["entry_time"] if db_trade else datetime.utcnow().isoformat(),
+                "filled": True,
+            }
+            restored += 1
+            logger.info(f"Restored position: {direction} {symbol} x{quantity} @ ${entry_price:.2f}")
+
+        # Warn about DB open trades that IBKR no longer shows (closed while bot was offline)
+        for symbol, db_trade in db_by_symbol.items():
+            if symbol not in ibkr_by_symbol:
+                logger.warning(
+                    f"DB has open trade for {symbol} (id={db_trade['id']}) but IBKR shows no position — "
+                    f"may have been closed while bot was offline. Marking as closed in DB."
+                )
+                await db.update_trade_exit(db_trade["id"], {
+                    "exit_price": db_trade["entry_price"],
+                    "pnl": 0.0,
+                    "rr_achieved": 0.0,
+                    "hold_minutes": 0.0,
+                    "exit_reason": "UNKNOWN_OFFLINE",
+                    "exit_time": datetime.utcnow().isoformat(),
+                })
+
+        if restored > 0:
+            logger.info(f"Position recovery complete: {restored} position(s) restored")
+            self.send("TelegramAgent", "send_message", {
+                "text": f"♻️ <b>Bot restarted</b> — restored {restored} open position(s) from IBKR."
+            })
+
     async def close_position(self, symbol: str, reason: str = "MANUAL"):
         """Request IBKRClientAgent to close a position."""
         self.send("IBKRClientAgent", "close_position", {
@@ -302,6 +365,16 @@ class ExecutionAgent(BaseAgent):
         if msg_type == "approved_order":
             # Store pending trade details before placing order
             symbol = payload["symbol"]
+
+            # Dedup guard: skip if we already have a pending or filled trade for this symbol
+            if symbol in self._open_trades:
+                existing = self._open_trades[symbol]
+                logger.warning(
+                    f"Ignoring duplicate approved_order for {symbol} — already "
+                    f"{'filled' if existing.get('filled') else 'pending'}"
+                )
+                return
+
             self._open_trades[symbol] = {
                 **payload,
                 "filled": False,
@@ -360,6 +433,12 @@ class ExecutionAgent(BaseAgent):
             self.send(message.sender, "positions_summary_response", {
                 "positions": summary,
             })
+
+        elif msg_type == "ibkr_reconnected":
+            # Restore positions that were open before restart
+            open_positions = payload.get("open_positions", [])
+            if open_positions:
+                await self._restore_positions(open_positions)
 
         elif msg_type == "bracket_order_response":
             result = payload.get("result")

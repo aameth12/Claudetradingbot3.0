@@ -73,9 +73,8 @@ class Orchestrator:
             self._tasks.append(task)
             logger.info(f"Started agent: {name}")
 
-        # Subscribe to market data after IBKR connects
+        # Give IBKR time to finish connecting
         await asyncio.sleep(5)
-        await self.ibkr_agent.subscribe_market_data(self.watchlist)
 
         # Start background tasks
         self._tasks.append(asyncio.create_task(self._heartbeat(), name="heartbeat"))

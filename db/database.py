@@ -216,6 +216,17 @@ async def get_daily_performance(days: int = 7) -> list[dict]:
         return [dict(row) for row in rows]
 
 
+async def get_open_trades() -> list[dict]:
+    """Get all trades that have no exit price yet (open positions in DB)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM trades WHERE exit_price IS NULL ORDER BY entry_time ASC"
+        )
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+
 async def insert_account_snapshot(snap: dict):
     """Insert an account snapshot."""
     async with aiosqlite.connect(DB_PATH) as db:
