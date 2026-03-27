@@ -30,7 +30,15 @@ class Orchestrator:
         self.ibkr_agent = IBKRClientAgent(config.get("ibkr", {}), orchestrator=self)
         self.data_agent = DataAgent(config.get("data", {}), self.watchlist, orchestrator=self)
         self.strategy_agent = StrategyAgent(config.get("strategy", {}), self.watchlist, orchestrator=self)
-        self.risk_agent = RiskAgent(config.get("risk", {}), orchestrator=self)
+        # Merge allow_shorts/allow_longs from strategy section into risk config
+        # (they live under strategy: in config.yaml but RiskAgent enforces them)
+        strategy_cfg = config.get("strategy", {})
+        risk_cfg = {
+            **config.get("risk", {}),
+            "allow_shorts": strategy_cfg.get("allow_shorts", True),
+            "allow_longs": strategy_cfg.get("allow_longs", True),
+        }
+        self.risk_agent = RiskAgent(risk_cfg, orchestrator=self)
         self.execution_agent = ExecutionAgent(config.get("risk", {}), orchestrator=self)
         self.telegram_agent = TelegramAgent(config.get("telegram", {}), orchestrator=self)
         self.performance_agent = PerformanceAgent(config.get("performance", {}), orchestrator=self)

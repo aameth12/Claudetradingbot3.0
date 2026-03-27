@@ -49,7 +49,7 @@ class IBKRClientAgent(BaseAgent):
             self.ib.disconnectedEvent += self._on_disconnect
             self.ib.errorEvent += self._on_error
 
-            asyncio.ensure_future(self._account_poll_loop())
+            asyncio.create_task(self._account_poll_loop())
 
         while self._running:
             await self._process_inbox()
@@ -64,8 +64,12 @@ class IBKRClientAgent(BaseAgent):
                 await self.ib.connectAsync(self.host, self.port, clientId=self.client_id)
                 self._connected = True
                 logger.info("Connected to IB Gateway successfully")
-                # Brief pause so IB Gateway can push initial position data
-                await asyncio.sleep(2)
+                # Subscribe to account updates ONCE here (not in the poll loop)
+                # reqAccountUpdates() inside an already-running asyncio context
+                # (util.run) causes "event loop already running" if called repeatedly
+                self.ib.reqAccountUpdates()
+                # Brief pause so IB Gateway can push initial position + account data
+                await asyncio.sleep(3)
                 positions = self.ib.positions()
                 open_positions = [
                     {"symbol": p.contract.symbol, "quantity": int(p.position), "avg_cost": p.avgCost}
@@ -301,12 +305,10 @@ class IBKRClientAgent(BaseAgent):
             accounts = self.ib.managedAccounts()
             if not accounts:
                 return
-            account_id = accounts[0]
+            account_id = accounts[0]  # noqa: F841 — kept for logging context
 
-            # Subscribe to account updates (ib_insync only takes subscribe bool, no acctCode)
-            self.ib.reqAccountUpdates()
-            await asyncio.sleep(1.5)  # Give IB time to push data
-
+            # Account updates are subscribed once in _connect().
+            # Here we just read ib_insync's cached values.
             # Read all cached values — do NOT filter by account_id here;
             # ib_insync stores values differently in paper vs live accounts
             account_values = self.ib.accountValues()

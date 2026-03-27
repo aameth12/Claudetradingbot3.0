@@ -152,11 +152,15 @@ class ExecutionAgent(BaseAgent):
 
         pnl_pct = (pnl / (entry_price * quantity) * 100) if (entry_price * quantity) else 0
 
-        # Calculate hold time
+        # Calculate hold time (strip timezone info before arithmetic)
         hold_minutes = 0
         try:
             entry_dt = datetime.fromisoformat(str(entry_time))
             exit_dt = datetime.fromisoformat(str(exec_time))
+            if entry_dt.tzinfo is not None:
+                entry_dt = entry_dt.replace(tzinfo=None)
+            if exit_dt.tzinfo is not None:
+                exit_dt = exit_dt.replace(tzinfo=None)
             hold_minutes = (exit_dt - entry_dt).total_seconds() / 60
         except Exception:
             pass
@@ -198,13 +202,17 @@ class ExecutionAgent(BaseAgent):
         )
         self.send("TelegramAgent", "send_message", {"text": alert_text})
 
-        # Notify RiskAgent of close
-        self.send("RiskAgent", "position_closed_notify", {"symbol": symbol})
+        # Notify RiskAgent of close (include pnl for consecutive loss tracking)
+        self.send("RiskAgent", "position_closed_notify", {"symbol": symbol, "pnl": round(pnl, 2)})
 
         # If opened and closed same calendar day → counts as a day trade
         try:
             entry_dt = datetime.fromisoformat(str(entry_time))
             exit_dt = datetime.fromisoformat(str(exec_time))
+            if entry_dt.tzinfo is not None:
+                entry_dt = entry_dt.replace(tzinfo=None)
+            if exit_dt.tzinfo is not None:
+                exit_dt = exit_dt.replace(tzinfo=None)
             if entry_dt.date() == exit_dt.date():
                 self.send("RiskAgent", "day_trade_completed", {"symbol": symbol})
         except Exception:
@@ -234,6 +242,9 @@ class ExecutionAgent(BaseAgent):
 
                 try:
                     entry_dt = datetime.fromisoformat(str(entry_time))
+                    # Strip timezone if present (treat as UTC for comparison)
+                    if entry_dt.tzinfo is not None:
+                        entry_dt = entry_dt.replace(tzinfo=None)
                     held_minutes = (now - entry_dt).total_seconds() / 60
 
                     if held_minutes >= self.max_hold_minutes:

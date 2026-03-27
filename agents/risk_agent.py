@@ -17,8 +17,10 @@ class RiskAgent(BaseAgent):
         self.max_stop_loss_pct = config.get("max_stop_loss_pct", 0.05)
         self.min_rr_ratio = config.get("min_rr_ratio", 2.0)
         self.max_positions = config.get("max_positions", 0)  # 0 = unlimited
-        self.allow_shorts = True
-        self.allow_longs = True
+        self.max_trades_per_day = config.get("max_trades_per_day", 0)  # 0 = unlimited
+        self.max_consecutive_losses = config.get("max_consecutive_losses", 0)  # 0 = disabled
+        self.allow_shorts = config.get("allow_shorts", True)
+        self.allow_longs = config.get("allow_longs", True)
         self._paused = False
 
         # State
@@ -31,6 +33,10 @@ class RiskAgent(BaseAgent):
         # PDT day trade counter (same-day round trips)
         self._day_trades_today = 0
         self._day_trades_date: date | None = None
+        # Daily trade counter and consecutive loss tracker
+        self._trades_today = 0
+        self._trades_today_date: date | None = None
+        self._consecutive_losses = 0
 
     async def run(self):
         while self._running:
@@ -50,6 +56,10 @@ class RiskAgent(BaseAgent):
             self._day_trades_today = 0
             self._day_trades_date = None
             logger.info("Day trade counter reset for new day")
+        if self._trades_today_date and today > self._trades_today_date:
+            self._trades_today = 0
+            self._trades_today_date = None
+            logger.info("Daily trade counter reset for new day")
 
     def validate_signal(self, signal: dict) -> tuple[bool, str, dict]:
         """
@@ -88,11 +98,19 @@ class RiskAgent(BaseAgent):
         if action == "SELL" and not self.allow_shorts:
             return False, "Short positions disabled", signal
 
-        # 4. DUPLICATE POSITION
+        # 4. MAX TRADES PER DAY
+        if self.max_trades_per_day > 0 and self._trades_today >= self.max_trades_per_day:
+            return False, f"Max trades per day reached ({self.max_trades_per_day})", signal
+
+        # 5. CONSECUTIVE LOSS LIMIT
+        if self.max_consecutive_losses > 0 and self._consecutive_losses >= self.max_consecutive_losses:
+            return False, f"Paused: {self._consecutive_losses} consecutive losses", signal
+
+        # 7. DUPLICATE POSITION
         if symbol in self._open_positions:
             return False, f"Already have open position in {symbol}", signal
 
-        # 5. MAX POSITIONS
+        # 8. MAX POSITIONS
         if self.max_positions > 0 and len(self._open_positions) >= self.max_positions:
             return False, f"Max positions reached ({self.max_positions})", signal
 
@@ -177,12 +195,17 @@ class RiskAgent(BaseAgent):
             "max_positions": self.max_positions,
             "max_daily_loss_pct": self.max_daily_loss_pct,
             "max_trade_risk_pct": self.max_trade_risk_pct,
+            "max_stop_loss_pct": self.max_stop_loss_pct,
             "min_rr_ratio": self.min_rr_ratio,
             "allow_shorts": self.allow_shorts,
             "allow_longs": self.allow_longs,
             "paused": self._paused,
             "day_trades_today": self._day_trades_today,
             "pdt_protected": self._nav < 25000,
+            "trades_today": self._trades_today,
+            "max_trades_per_day": self.max_trades_per_day,
+            "consecutive_losses": self._consecutive_losses,
+            "max_consecutive_losses": self.max_consecutive_losses,
         }
 
     async def handle_message(self, message: Message):
@@ -193,6 +216,8 @@ class RiskAgent(BaseAgent):
             approved, reason, adjusted = self.validate_signal(payload)
             if approved:
                 logger.info(f"Risk approved: {payload['symbol']} {payload['action']}")
+                self._trades_today += 1
+                self._trades_today_date = date.today()
                 self.send("ExecutionAgent", "approved_order", adjusted)
             else:
                 logger.info(f"Risk rejected: {payload['symbol']} — {reason}")
@@ -229,6 +254,7 @@ class RiskAgent(BaseAgent):
 
         elif msg_type == "resume":
             self._paused = False
+            self._consecutive_losses = 0  # Reset on manual resume
 
         elif msg_type == "position_opened":
             symbol = payload.get("symbol")
@@ -237,6 +263,25 @@ class RiskAgent(BaseAgent):
         elif msg_type == "position_closed_notify":
             symbol = payload.get("symbol")
             self._open_positions.pop(symbol, None)
+            # Track consecutive losses
+            pnl = payload.get("pnl", 0)
+            if pnl is not None:
+                if pnl < 0:
+                    self._consecutive_losses += 1
+                    logger.info(f"Consecutive losses: {self._consecutive_losses}")
+                    if self.max_consecutive_losses > 0 and self._consecutive_losses >= self.max_consecutive_losses:
+                        logger.warning(
+                            f"Consecutive loss limit hit ({self._consecutive_losses}). "
+                            "New signals paused until manual /resume or new day."
+                        )
+                        self.send("TelegramAgent", "send_message", {
+                            "text": (
+                                f"\U0001f6d1 <b>Consecutive loss limit reached</b> ({self._consecutive_losses} losses)\n"
+                                "New signals paused. Use /resume to continue or wait for tomorrow."
+                            )
+                        })
+                else:
+                    self._consecutive_losses = 0  # Reset on any win
 
         elif msg_type == "day_trade_completed":
             # Increment day trade counter when a position is opened and closed same day

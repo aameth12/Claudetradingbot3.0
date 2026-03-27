@@ -253,21 +253,28 @@ class TelegramAgent(BaseAgent):
         paused = self._risk_data.get("paused", False)
         mode_str = "\u23f8 PAUSED" if paused else "\u25b6 RUNNING"
 
-        # Today's trades
+        # Today's trades (all entries incl. still-open)
         today_trades = await db.get_todays_trades()
-        today_count = len(today_trades)
-        today_wins = sum(1 for t in today_trades if t.get("pnl") and t["pnl"] > 0)
-        today_pnl = sum(t.get("pnl", 0) for t in today_trades if t.get("pnl"))
+        today_closed = [t for t in today_trades if t.get("exit_price") is not None]
+        today_open_count = len(today_trades) - len(today_closed)
+        today_wins = sum(1 for t in today_closed if t.get("pnl", 0) > 0)
+        today_losses = sum(1 for t in today_closed if t.get("pnl", 0) < 0)
+        today_pnl = sum(t.get("pnl", 0) for t in today_closed)
 
-        # All-time
+        # All-time closed trades
         all_trades = await db.get_all_trades()
         all_count = len(all_trades)
-        all_wins = sum(1 for t in all_trades if t.get("pnl") and t["pnl"] > 0)
+        all_wins = sum(1 for t in all_trades if t.get("pnl", 0) > 0)
         all_win_rate = (all_wins / all_count * 100) if all_count else 0
         all_pnl = sum(t.get("pnl", 0) for t in all_trades)
-        gross_profit = sum(t["pnl"] for t in all_trades if t.get("pnl") and t["pnl"] > 0)
-        gross_loss = abs(sum(t["pnl"] for t in all_trades if t.get("pnl") and t["pnl"] < 0))
+        gross_profit = sum(t["pnl"] for t in all_trades if t.get("pnl", 0) > 0)
+        gross_loss = abs(sum(t["pnl"] for t in all_trades if t.get("pnl", 0) < 0))
         profit_factor = (gross_profit / gross_loss) if gross_loss else 0
+
+        r = self._risk_data
+        cons_losses = r.get("consecutive_losses", 0)
+        trades_today_count = r.get("trades_today", 0)
+        max_tpd = r.get("max_trades_per_day", 0)
 
         text = f"<b>Dashboard</b>\n{'=' * 30}\n"
         text += f"Market: {market_status}\n"
@@ -282,11 +289,18 @@ class TelegramAgent(BaseAgent):
         text += f"  Balance: ${nav:,.0f}\n"
         text += f"  Total P&L: {format_currency(total_pnl)}\n"
         text += f"<b>Today</b>\n{'-' * 30}\n"
-        text += f"Trades: {today_count} | Wins: {today_wins} | P&L: {format_currency(today_pnl)}\n"
-        text += f"<b>All-Time (Bot Tracked)</b>\n{'-' * 30}\n"
-        text += f"Total Trades: {all_count} | Win Rate: {all_win_rate:.1f}%\n"
-        text += f"Total P&L: {format_currency(all_pnl)}\n"
-        text += f"Profit Factor: {profit_factor:.2f}\n"
+        tpd_str = f"/{max_tpd}" if max_tpd > 0 else ""
+        text += f"Entries: {trades_today_count}{tpd_str} | Open: {today_open_count}\n"
+        text += f"Closed: {len(today_closed)} | W:{today_wins} L:{today_losses} | P&L: {format_currency(today_pnl)}\n"
+        if cons_losses > 0:
+            text += f"Consecutive losses: {cons_losses}\n"
+        text += f"<b>All-Time (closed trades)</b>\n{'-' * 30}\n"
+        if all_count == 0:
+            text += "No closed trades yet.\n"
+        else:
+            text += f"Total: {all_count} | Win Rate: {all_win_rate:.1f}%\n"
+            text += f"Total P&L: {format_currency(all_pnl)}\n"
+            text += f"Profit Factor: {profit_factor:.2f}\n"
 
         # Open positions
         if self._positions_data:
@@ -344,16 +358,23 @@ class TelegramAgent(BaseAgent):
             return
 
         r = self._risk_data
+        max_pos = r.get("max_positions", 0)
+        max_tpd = r.get("max_trades_per_day", 0)
+        max_cl = r.get("max_consecutive_losses", 0)
+        cl = r.get("consecutive_losses", 0)
+        td = r.get("trades_today", 0)
         text = (
             f"<b>Risk Dashboard</b>\n"
             f"NAV: ${r.get('nav', 0):,.0f}\n"
             f"Daily Loss Halt: {'YES \U0001f6d1' if r.get('daily_loss_halt') else 'No'}\n"
             f"Open Positions: {r.get('open_positions_count', 0)}"
-            + (f" / {r.get('max_positions', 0)}" if r.get('max_positions', 0) > 0 else "")
-            + "\n"
-            f"Max Daily Loss: {r.get('max_daily_loss_pct', 0) * 100:.0f}%\n"
-            f"Max Trade Risk: {r.get('max_trade_risk_pct', 0) * 100:.0f}%\n"
+            + (f"/{max_pos}" if max_pos > 0 else "") + "\n"
+            + f"Trades Today: {td}" + (f"/{max_tpd}" if max_tpd > 0 else "") + "\n"
+            + f"Consecutive Losses: {cl}" + (f"/{max_cl}" if max_cl > 0 else "") + "\n"
+            + f"Max Daily Loss: {r.get('max_daily_loss_pct', 0) * 100:.0f}%\n"
+            f"Max SL: {r.get('max_stop_loss_pct', 0) * 100:.0f}% | "
             f"Min R:R: {r.get('min_rr_ratio', 0):.1f}\n"
+            f"Max Trade Risk: {r.get('max_trade_risk_pct', 0) * 100:.0f}%\n"
             f"Longs: {'ON' if r.get('allow_longs') else 'OFF'} | "
             f"Shorts: {'ON' if r.get('allow_shorts') else 'OFF'}\n"
         )
