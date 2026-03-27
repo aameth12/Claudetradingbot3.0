@@ -300,55 +300,66 @@ class IBKRClientAgent(BaseAgent):
             await asyncio.sleep(30)
 
     async def _poll_account(self):
-        """Fetch account and position data from IB using reqAccountSummaryAsync for fresh data."""
-        try:
-            # reqAccountSummaryAsync explicitly requests fresh account data from IB
-            # (unlike accountValues() which only reads the cached push-subscription data
-            # and returns nothing if the cache hasn't been populated yet)
-            summary = await self.ib.reqAccountSummaryAsync()
+        """Fetch account and position data from IB.
 
+        Paper accounts often tag currency as 'BASE' (not 'USD'), so we accept both.
+        Uses reqAccountSummaryAsync() first; falls back to cached accountValues().
+        """
+        try:
             nav = 0.0
             buying_power = 0.0
             realized_pnl = 0.0
             unrealized_pnl = 0.0
 
-            for av in summary:
-                tag = av.tag
-                cur = av.currency
-                try:
-                    val = float(av.value)
-                except (ValueError, TypeError):
-                    continue
-                if tag == "NetLiquidation" and cur == "USD":
-                    nav = val
-                elif tag == "BuyingPower" and cur == "USD":
-                    buying_power = val
-                elif tag == "RealizedPnL" and cur == "USD":
-                    realized_pnl = val
-                elif tag == "UnrealizedPnL" and cur == "USD":
-                    unrealized_pnl = val
+            def _parse_values(items):
+                nonlocal nav, buying_power, realized_pnl, unrealized_pnl
+                for av in items:
+                    # Paper accounts use 'BASE'; live accounts use 'USD'; accept both
+                    if av.currency not in ("USD", "BASE", ""):
+                        continue
+                    try:
+                        val = float(av.value)
+                    except (ValueError, TypeError):
+                        continue
+                    if av.tag == "NetLiquidation" and nav == 0:
+                        nav = val
+                    elif av.tag == "BuyingPower" and buying_power == 0:
+                        buying_power = val
+                    elif av.tag == "RealizedPnL":
+                        realized_pnl = val
+                    elif av.tag == "UnrealizedPnL":
+                        unrealized_pnl = val
+                    elif av.tag == "EquityWithLoanValue" and nav == 0:
+                        nav = val  # last-resort within same pass
 
-            # Fallback: EquityWithLoanValue if NetLiquidation not present
+            # Method 1: explicit fresh request
+            try:
+                summary = await self.ib.reqAccountSummaryAsync()
+                logger.debug(f"Account summary: {len(summary)} items, tags={list({a.tag for a in summary})}")
+                _parse_values(summary)
+            except Exception as e:
+                logger.warning(f"reqAccountSummaryAsync failed: {e}")
+
+            # Method 2: cached push data from reqAccountUpdates (subscribed in _connect)
             if nav == 0:
-                for av in summary:
-                    if av.tag == "EquityWithLoanValue" and av.currency == "USD":
-                        try:
-                            nav = float(av.value)
-                        except (ValueError, TypeError):
-                            pass
+                cached = self.ib.accountValues()
+                logger.debug(f"accountValues fallback: {len(cached)} items")
+                _parse_values(cached)
+
+            if nav == 0:
+                logger.warning("Account poll: NAV=0 after all methods — IB may not have sent data yet")
 
             # Read cached positions
             positions = self.ib.positions()
-
-            open_positions = []
-            for pos in positions:
-                if pos.position != 0:
-                    open_positions.append({
-                        "symbol": pos.contract.symbol,
-                        "quantity": int(pos.position),
-                        "avg_cost": pos.avgCost,
-                        "unrealized_pnl": 0.0,
-                    })
+            open_positions = [
+                {
+                    "symbol": p.contract.symbol,
+                    "quantity": int(p.position),
+                    "avg_cost": p.avgCost,
+                    "unrealized_pnl": 0.0,
+                }
+                for p in positions if p.position != 0
+            ]
 
             self._account_data = {
                 "nav": nav,
@@ -361,9 +372,9 @@ class IBKRClientAgent(BaseAgent):
 
             if nav > 0:
                 self.broadcast("account_update", self._account_data)
-                logger.debug(f"Account poll: NAV=${nav:,.2f}, BP=${buying_power:,.2f}")
+                logger.info(f"Account update broadcast: NAV=${nav:,.2f}  BP=${buying_power:,.2f}")
             else:
-                logger.debug("Account poll: NAV still 0, skipping broadcast")
+                logger.warning("Account poll: NAV=0, skipping broadcast — check IB account permissions")
         except Exception as e:
             logger.warning(f"Error polling account: {e}")
 

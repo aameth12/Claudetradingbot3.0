@@ -9,13 +9,13 @@ It listens for:
 """
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 
 from loguru import logger
 
 from agents.base_agent import BaseAgent, Message
 from db import database as db
-from utils.helpers import format_currency, format_pct, is_market_open, pnl_emoji
+from utils.helpers import format_currency, format_pct, pnl_emoji
 
 
 def _parse_naive_dt(value: str) -> "datetime | None":
@@ -402,9 +402,17 @@ class ExecutionAgent(BaseAgent):
                 )
                 return
 
-            # Market hours guard: don't place DAY orders when exchange is closed
-            if not is_market_open():
-                logger.warning(f"Market is closed — skipping order for {symbol}")
+            # Market hours guard: NYSE trades 13:30–20:00 UTC (EDT) / 14:30–21:00 UTC (EST)
+            # Use conservative 19:50 UTC cutoff (10 min before EDT close) and require weekday.
+            # Pure UTC arithmetic — no timezone library dependency that could raise silently.
+            _utc = datetime.now(timezone.utc)
+            _mins_utc = _utc.hour * 60 + _utc.minute
+            _market_open = _utc.weekday() < 5 and (13 * 60 + 30) <= _mins_utc <= (19 * 60 + 50)
+            if not _market_open:
+                logger.warning(
+                    f"Market closed (UTC {_utc.strftime('%H:%M')} wd={_utc.weekday()}) "
+                    f"— skipping {payload.get('action','BUY')} {symbol}"
+                )
                 self.send("TelegramAgent", "send_message", {
                     "text": (
                         f"\u23f0 <b>Market closed</b> — skipped {payload.get('action','BUY')} "
