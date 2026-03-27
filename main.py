@@ -73,10 +73,15 @@ def main():
     logger.info("AI Multi-Agent Day Trading Bot v2.0")
     logger.info("=" * 60)
 
-    # Use ib_insync's util.run() which properly manages the event loop
-    # for compatibility with ib_insync's internal async/sync patterns
     from ib_insync import util
     from orchestrator.orchestrator import Orchestrator
+
+    # MUST be called before util.run() — patches asyncio to allow nested
+    # event loops so ib_insync 0.9.86's synchronous methods (which internally
+    # call loop.run_until_complete via util.syncAwait) work inside a running
+    # async context without raising "This event loop is already running".
+    # nest_asyncio is already in requirements.txt.
+    util.patchAsyncio()
 
     orchestrator = Orchestrator(config)
 

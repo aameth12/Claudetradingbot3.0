@@ -18,6 +18,30 @@ from db import database as db
 from utils.helpers import format_currency, format_pct, pnl_emoji
 
 
+def _parse_naive_dt(value: str) -> "datetime | None":
+    """
+    Parse a datetime string to a naive (timezone-stripped) datetime.
+    Handles ISO format with or without timezone offset (e.g. +00:00, Z).
+    Returns None if parsing fails so callers can skip safely.
+    """
+    if not value:
+        return None
+    # Normalise 'Z' suffix → '+00:00'
+    s = value.strip().replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        # IB sometimes returns "YYYYMMDD  HH:MM:SS" — try that format
+        try:
+            dt = datetime.strptime(s.strip(), "%Y%m%d  %H:%M:%S")
+        except ValueError:
+            return None
+    # Strip timezone so arithmetic with datetime.utcnow() (naive) works
+    if dt.tzinfo is not None:
+        dt = dt.replace(tzinfo=None)
+    return dt
+
+
 class ExecutionAgent(BaseAgent):
     def __init__(self, config: dict, orchestrator=None):
         super().__init__("ExecutionAgent", orchestrator)
@@ -152,16 +176,13 @@ class ExecutionAgent(BaseAgent):
 
         pnl_pct = (pnl / (entry_price * quantity) * 100) if (entry_price * quantity) else 0
 
-        # Calculate hold time (strip timezone info before arithmetic)
+        # Calculate hold time
         hold_minutes = 0
         try:
-            entry_dt = datetime.fromisoformat(str(entry_time))
-            exit_dt = datetime.fromisoformat(str(exec_time))
-            if entry_dt.tzinfo is not None:
-                entry_dt = entry_dt.replace(tzinfo=None)
-            if exit_dt.tzinfo is not None:
-                exit_dt = exit_dt.replace(tzinfo=None)
-            hold_minutes = (exit_dt - entry_dt).total_seconds() / 60
+            entry_dt = _parse_naive_dt(str(entry_time))
+            exit_dt = _parse_naive_dt(str(exec_time))
+            if entry_dt and exit_dt:
+                hold_minutes = (exit_dt - entry_dt).total_seconds() / 60
         except Exception:
             pass
 
@@ -207,13 +228,9 @@ class ExecutionAgent(BaseAgent):
 
         # If opened and closed same calendar day → counts as a day trade
         try:
-            entry_dt = datetime.fromisoformat(str(entry_time))
-            exit_dt = datetime.fromisoformat(str(exec_time))
-            if entry_dt.tzinfo is not None:
-                entry_dt = entry_dt.replace(tzinfo=None)
-            if exit_dt.tzinfo is not None:
-                exit_dt = exit_dt.replace(tzinfo=None)
-            if entry_dt.date() == exit_dt.date():
+            entry_dt = _parse_naive_dt(str(entry_time))
+            exit_dt = _parse_naive_dt(str(exec_time))
+            if entry_dt and exit_dt and entry_dt.date() == exit_dt.date():
                 self.send("RiskAgent", "day_trade_completed", {"symbol": symbol})
         except Exception:
             pass
@@ -241,10 +258,9 @@ class ExecutionAgent(BaseAgent):
                     continue
 
                 try:
-                    entry_dt = datetime.fromisoformat(str(entry_time))
-                    # Strip timezone if present (treat as UTC for comparison)
-                    if entry_dt.tzinfo is not None:
-                        entry_dt = entry_dt.replace(tzinfo=None)
+                    entry_dt = _parse_naive_dt(str(entry_time))
+                    if entry_dt is None:
+                        continue
                     held_minutes = (now - entry_dt).total_seconds() / 60
 
                     if held_minutes >= self.max_hold_minutes:
