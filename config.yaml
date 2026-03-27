@@ -40,14 +40,14 @@ strategy:
   allow_longs: true
 
 risk:
-  max_daily_loss_pct: 0.03        # halt if down 3% on the day
+  max_daily_loss_pct: 0.10        # halt if down 10% on the day
   max_trade_risk_pct: 0.01        # risk only 1% of NAV per trade
   max_stop_loss_pct: 0.02         # SL clamped to 2% from entry (tight intraday)
-  min_rr_ratio: 1.5               # TP at least 1.5× the SL distance (was 2.0)
-  max_positions: 3                # no more than 3 open at once
+  min_rr_ratio: 2.0               # TP at least 2× the SL distance
+  max_positions: 0                # unlimited
   max_hold_minutes: 120           # auto-close after 2 hours
-  max_trades_per_day: 5           # stop after 5 trades per day
-  max_consecutive_losses: 3       # pause after 3 losses in a row
+  max_trades_per_day: 0           # 0 = unlimited
+  max_consecutive_losses: 7       # pause after 7 losses in a row
 
 performance:
   daily_pnl_target: 100.0
