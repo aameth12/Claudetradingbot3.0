@@ -51,6 +51,7 @@ def main():
     orchestrator = Orchestrator(config)
 
     try:
+        util.patchAsyncio()   # Allow nested event loops (Python 3.12+)
         util.run(orchestrator.start())
     except KeyboardInterrupt:
         logger.info("Interrupted by user")

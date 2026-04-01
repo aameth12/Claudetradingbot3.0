@@ -173,6 +173,10 @@ class IBKRClientAgent(BaseAgent):
                     "fill_type": "exit",
                 })
             else:
+                logger.warning(
+                    f"UNMATCHED FILL (standalone close): {symbol} orderId={order_id} "
+                    f"not in bracket_groups (keys={list(self._bracket_groups.keys())})"
+                )
                 self.broadcast("order_filled", {
                     "symbol": symbol, "fill_price": fill_price,
                     "quantity": quantity, "side": side,
@@ -277,13 +281,14 @@ class IBKRClientAgent(BaseAgent):
                     val = float(av.value)
                 except (ValueError, TypeError):
                     continue
-                if tag in ("NetLiquidation", "NetLiquidationByCurrency") and cur == "USD":
+                # Paper accounts report currency as "BASE" not "USD" — accept both
+                if tag in ("NetLiquidation", "NetLiquidationByCurrency") and cur in ("USD", "BASE", ""):
                     nav = val
-                elif tag == "BuyingPower":
+                elif tag == "BuyingPower" and cur in ("USD", "BASE", ""):
                     buying_power = val
-                elif tag == "RealizedPnL" and cur == "USD":
+                elif tag == "RealizedPnL" and cur in ("USD", "BASE", ""):
                     realized_pnl = val
-                elif tag == "UnrealizedPnL" and cur == "USD":
+                elif tag == "UnrealizedPnL" and cur in ("USD", "BASE", ""):
                     unrealized_pnl = val
 
             # Read cached positions
@@ -309,6 +314,18 @@ class IBKRClientAgent(BaseAgent):
             }
 
             self.broadcast("account_update", self._account_data)
+
+            if nav > 0:
+                logger.info(f"Account update broadcast: NAV=${nav:,.2f}, BP=${buying_power:,.2f}, "
+                            f"realized=${realized_pnl:,.2f}, unrealized=${unrealized_pnl:,.2f}, "
+                            f"positions={len(open_positions)}")
+            else:
+                currencies_seen = {av.currency for av in account_values}
+                logger.warning(
+                    f"NAV is 0 after poll — {len(account_values)} account values, "
+                    f"currencies seen: {currencies_seen}. "
+                    f"Check if IB Gateway is fully connected."
+                )
         except Exception as e:
             logger.warning(f"Error polling account: {e}")
 

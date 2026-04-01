@@ -1,8 +1,9 @@
-"""Orchestrator — Message bus, heartbeat, position poller."""
+"""Orchestrator — Message bus, heartbeat, position poller, state integrity checker."""
 
 import asyncio
 import signal
 import sys
+from datetime import datetime
 
 import yaml
 from loguru import logger
@@ -34,6 +35,16 @@ class Orchestrator:
         self.execution_agent = ExecutionAgent(config.get("risk", {}), orchestrator=self)
         self.telegram_agent = TelegramAgent(config.get("telegram", {}), orchestrator=self)
         self.performance_agent = PerformanceAgent(config.get("performance", {}), orchestrator=self)
+
+        # Merge strategy direction filters into RiskAgent
+        # (they live under strategy: in config.yaml but RiskAgent only receives risk: section)
+        strategy_cfg = config.get("strategy", {})
+        self.risk_agent.allow_shorts = strategy_cfg.get("allow_shorts", True)
+        self.risk_agent.allow_longs = strategy_cfg.get("allow_longs", True)
+        logger.info(
+            f"Strategy config: allow_longs={self.risk_agent.allow_longs}, "
+            f"allow_shorts={self.risk_agent.allow_shorts}"
+        )
 
         self.agents: dict[str, BaseAgent] = {
             "IBKRClientAgent": self.ibkr_agent,
@@ -80,6 +91,7 @@ class Orchestrator:
         # Start background tasks
         self._tasks.append(asyncio.create_task(self._heartbeat(), name="heartbeat"))
         self._tasks.append(asyncio.create_task(self._position_poller(), name="position_poller"))
+        self._tasks.append(asyncio.create_task(self._state_integrity_checker(), name="state_checker"))
 
         # Set up signal handlers (Windows-safe)
         try:
@@ -132,7 +144,7 @@ class Orchestrator:
             await asyncio.sleep(60)
 
     async def _position_poller(self):
-        """30-second loop: push live position P&L and risk data to TelegramAgent."""
+        """30-second loop: push live position P&L, reconcile IBKR vs _open_trades."""
         while self._running:
             await asyncio.sleep(30)
             try:
@@ -164,8 +176,122 @@ class Orchestrator:
                     payload=risk_summary,
                 ))
 
+                # ── IBKR Position Reconciler ──────────────────────────────────
+                # Compare live IBKR positions with _open_trades to catch
+                # externally-opened or externally-closed positions.
+                try:
+                    ib_positions = {
+                        pos.contract.symbol: pos
+                        for pos in self.ibkr_agent.ib.positions()
+                        if pos.position != 0
+                    }
+                    tracked = set(self.execution_agent._open_trades.keys())
+                    ib_syms = set(ib_positions.keys())
+
+                    # IBKR has a position the bot isn't tracking → restore it
+                    for sym in ib_syms - tracked:
+                        pos = ib_positions[sym]
+                        qty = int(pos.position)
+                        logger.warning(
+                            f"RECONCILER: {sym} open in IBKR (qty={qty}) "
+                            f"but missing from _open_trades — restoring"
+                        )
+                        self.execution_agent._open_trades[sym] = {
+                            "symbol": sym,
+                            "action": "BUY" if qty > 0 else "SELL",
+                            "direction": "LONG" if qty > 0 else "SHORT",
+                            "quantity": abs(qty),
+                            "entry_price": pos.avgCost,
+                            "stop_loss": 0,
+                            "take_profit": 0,
+                            "filled": True,
+                            "entry_time": datetime.utcnow().isoformat(),
+                            "db_id": None,
+                        }
+                        await self.telegram_agent.inbox.put(Message(
+                            sender="Orchestrator",
+                            recipient="TelegramAgent",
+                            type="send_message",
+                            payload={
+                                "text": (
+                                    f"\u26a0\ufe0f <b>Untracked position restored</b>\n"
+                                    f"{sym} {'LONG' if qty > 0 else 'SHORT'} x{abs(qty)} "
+                                    f"@ ${pos.avgCost:.2f} (from IBKR)"
+                                )
+                            },
+                        ))
+
+                    # Bot is tracking a position IBKR doesn't show → clean up
+                    for sym in tracked - ib_syms:
+                        trade = self.execution_agent._open_trades.get(sym, {})
+                        if trade.get("filled"):
+                            logger.warning(
+                                f"RECONCILER: {sym} in _open_trades but IBKR shows 0 "
+                                f"— removing as UNKNOWN_CLOSE"
+                            )
+                            await self.execution_agent.inbox.put(Message(
+                                sender="Orchestrator",
+                                recipient="ExecutionAgent",
+                                type="close_position_response",
+                                payload={"symbol": sym, "success": False, "reason": "UNKNOWN_CLOSE"},
+                            ))
+                except Exception as e:
+                    logger.warning(f"Reconciler error: {e}")
+
             except Exception as e:
                 logger.warning(f"Position poller error: {e}")
+
+    async def _state_integrity_checker(self):
+        """
+        Every 60s: cross-check all internal state, log a health summary,
+        and send a Telegram alert when state diverges.
+        """
+        while self._running:
+            await asyncio.sleep(60)
+            try:
+                open_trades = dict(self.execution_agent._open_trades)
+                risk_positions = dict(self.risk_agent._open_positions)
+                ib_positions = {
+                    pos.contract.symbol: pos
+                    for pos in self.ibkr_agent.ib.positions()
+                    if pos.position != 0
+                }
+                nav = self.risk_agent._nav
+                bracket_count = len(self.ibkr_agent._bracket_groups)
+                connected = self.ibkr_agent._connected
+
+                logger.info(
+                    f"[STATE] connected={connected} | NAV=${nav:,.0f} | "
+                    f"_open_trades={list(open_trades.keys())} | "
+                    f"risk_positions={list(risk_positions.keys())} | "
+                    f"IBKR_positions={list(ib_positions.keys())} | "
+                    f"bracket_groups={bracket_count}"
+                )
+
+                alerts = []
+                if not connected:
+                    alerts.append("Not connected to IB Gateway")
+                if nav <= 0:
+                    alerts.append("NAV=$0 — account_update not receiving data")
+                for sym in open_trades:
+                    if open_trades[sym].get("filled") and sym not in ib_positions:
+                        alerts.append(f"{sym} in _open_trades but IBKR=0 (ghost position)")
+                for sym in ib_positions:
+                    if sym not in open_trades:
+                        alerts.append(f"{sym} open in IBKR but not tracked")
+
+                if alerts:
+                    alert_text = "\u26a0\ufe0f <b>State Mismatch Detected</b>\n" + "\n".join(
+                        f"• {a}" for a in alerts
+                    )
+                    await self.telegram_agent.inbox.put(Message(
+                        sender="Orchestrator",
+                        recipient="TelegramAgent",
+                        type="send_message",
+                        payload={"text": alert_text},
+                    ))
+            except Exception as e:
+                logger.warning(f"State checker error: {e}")
 
     async def _shutdown(self):
         """Graceful shutdown: close positions, notify, stop agents."""

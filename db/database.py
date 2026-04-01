@@ -157,6 +157,17 @@ async def get_all_trades() -> list[dict]:
         return [dict(row) for row in rows]
 
 
+async def get_open_trades() -> list[dict]:
+    """Get trades with no exit_time (still open per DB)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM trades WHERE exit_time IS NULL ORDER BY entry_time DESC"
+        )
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+
 async def get_symbol_trades(symbol: str, limit: int = 100) -> list[dict]:
     """Get recent trades for a specific symbol."""
     async with aiosqlite.connect(DB_PATH) as db:

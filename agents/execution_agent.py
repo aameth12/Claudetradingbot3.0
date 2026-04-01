@@ -6,16 +6,30 @@ via IBKRClientAgent, and tracks positions through their full lifecycle.
 It listens for:
   - order_filled (from IBKRClientAgent) — records entry in SQLite, sends Telegram alert
   - position_closed (from IBKRClientAgent) — calculates P&L, updates SQLite, sends alert
+  - close_position_response (from IBKRClientAgent) — handles failed close attempts
+  - ibkr_reconnected (broadcast) — restores positions from IBKR on reconnect
 """
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 
 from loguru import logger
 
 from agents.base_agent import BaseAgent, Message
 from db import database as db
 from utils.helpers import format_currency, format_pct, pnl_emoji
+
+
+def _parse_naive_dt(dt_str: str) -> datetime:
+    """Strip timezone info and return a naive datetime for arithmetic."""
+    s = str(dt_str).strip()
+    for suffix in ("+00:00", "Z", "+0000"):
+        if s.endswith(suffix):
+            s = s[: -len(suffix)]
+    # IB sometimes returns "YYYYMMDD HH:MM:SS"
+    if len(s) == 17 and s[8] == " ":
+        return datetime.strptime(s, "%Y%m%d %H:%M:%S")
+    return datetime.fromisoformat(s)
 
 
 class ExecutionAgent(BaseAgent):
@@ -97,6 +111,12 @@ class ExecutionAgent(BaseAgent):
             "filled": True,
         }
 
+        logger.info(
+            f"ENTRY FILL: {direction} {symbol} x{quantity} @ ${fill_price:.2f} "
+            f"| SL=${stop_loss:.2f} TP=${take_profit:.2f} | db_id={trade_id}"
+        )
+        logger.debug(f"_open_trades now: {list(self._open_trades.keys())}")
+
         # Calculate display values
         sl_pct = abs(stop_loss - fill_price) / fill_price * 100 if fill_price else 0
         tp_pct = abs(take_profit - fill_price) / fill_price * 100 if fill_price else 0
@@ -120,8 +140,6 @@ class ExecutionAgent(BaseAgent):
             "entry_price": fill_price,
         })
 
-        logger.info(f"Position opened: {direction} {symbol} x{quantity} @ ${fill_price:.2f}")
-
     async def _on_position_closed(self, payload: dict):
         """
         Handle a position close event from IBKRClientAgent.
@@ -135,7 +153,7 @@ class ExecutionAgent(BaseAgent):
 
         trade = self._open_trades.get(symbol)
         if not trade:
-            logger.warning(f"Position close for {symbol} but no open trade found")
+            logger.warning(f"Position close for {symbol} but no open trade found — ignoring")
             return
 
         entry_price = trade.get("entry_price", 0)
@@ -152,14 +170,14 @@ class ExecutionAgent(BaseAgent):
 
         pnl_pct = (pnl / (entry_price * quantity) * 100) if (entry_price * quantity) else 0
 
-        # Calculate hold time
+        # Calculate hold time using timezone-safe parser
         hold_minutes = 0
         try:
-            entry_dt = datetime.fromisoformat(str(entry_time))
-            exit_dt = datetime.fromisoformat(str(exec_time))
+            entry_dt = _parse_naive_dt(entry_time)
+            exit_dt = _parse_naive_dt(exec_time)
             hold_minutes = (exit_dt - entry_dt).total_seconds() / 60
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Could not parse hold time for {symbol}: {e}")
 
         # Calculate achieved R:R
         stop_loss = trade.get("stop_loss", 0)
@@ -205,9 +223,10 @@ class ExecutionAgent(BaseAgent):
         del self._open_trades[symbol]
 
         logger.info(
-            f"Position closed: {direction} {symbol} x{quantity} @ ${fill_price:.2f} "
-            f"| P&L: {format_currency(pnl)} | Reason: {exit_reason}"
+            f"EXIT FILL: {direction} {symbol} x{quantity} @ ${fill_price:.2f} "
+            f"| P&L: {format_currency(pnl)} | Reason: {exit_reason} | held {hold_minutes:.0f}m"
         )
+        logger.debug(f"_open_trades now: {list(self._open_trades.keys())}")
 
     async def _monitor_positions(self):
         """Check for positions exceeding max hold time and auto-close."""
@@ -219,19 +238,37 @@ class ExecutionAgent(BaseAgent):
                 if not trade.get("filled"):
                     continue
 
+                # Skip if already waiting for a close fill
+                if trade.get("_closing"):
+                    logger.debug(f"Skipping {symbol} — close already in flight")
+                    continue
+
                 entry_time = trade.get("entry_time")
                 if not entry_time:
                     continue
 
                 try:
-                    entry_dt = datetime.fromisoformat(str(entry_time))
+                    entry_dt = _parse_naive_dt(entry_time)
                     held_minutes = (now - entry_dt).total_seconds() / 60
 
                     if held_minutes >= self.max_hold_minutes:
-                        logger.info(f"Auto-closing {symbol} — held {held_minutes:.0f}m (max {self.max_hold_minutes}m)")
+                        logger.info(
+                            f"Auto-closing {symbol} — held {held_minutes:.0f}m "
+                            f"(max {self.max_hold_minutes}m)"
+                        )
+                        trade["_closing"] = True
                         await self.close_position(symbol, "EOD")
                 except Exception as e:
                     logger.warning(f"Error checking hold time for {symbol}: {e}")
+
+    async def _restore_positions(self):
+        """
+        On ibkr_reconnected: request account snapshot from IBKRClientAgent
+        and reconcile IBKR live positions with _open_trades.
+        A separate account_response handler does the actual reconciliation.
+        """
+        logger.info("Requesting account snapshot to restore positions after reconnect")
+        self.send("IBKRClientAgent", "get_account", {})
 
     async def close_position(self, symbol: str, reason: str = "MANUAL"):
         """Request IBKRClientAgent to close a position."""
@@ -286,15 +323,40 @@ class ExecutionAgent(BaseAgent):
         payload = message.payload
 
         if msg_type == "approved_order":
-            # Store pending trade details before placing order
             symbol = payload["symbol"]
+
+            # Guard: don't open a duplicate position
+            if symbol in self._open_trades:
+                logger.warning(f"Duplicate order ignored: {symbol} already in _open_trades")
+                return
+
+            # Guard: only place orders during market hours (NYSE, UTC-based)
+            _utc = datetime.now(timezone.utc)
+            _mins = _utc.hour * 60 + _utc.minute
+            _market_open = _utc.weekday() < 5 and (13 * 60 + 30) <= _mins <= (19 * 60 + 50)
+            if not _market_open:
+                logger.warning(
+                    f"Order for {symbol} skipped — market closed "
+                    f"(UTC {_utc.strftime('%H:%M %a')})"
+                )
+                self.send(
+                    "TelegramAgent", "send_message",
+                    {"text": f"\u23f0 <b>Order skipped</b>: {symbol} — market closed"},
+                )
+                return
+
+            # Store pending trade details before placing order
             self._open_trades[symbol] = {
                 **payload,
                 "filled": False,
                 "pending_time": datetime.utcnow().isoformat(),
             }
+            logger.info(
+                f"Bracket order queued for {symbol}: "
+                f"{payload['action']} x{payload['quantity']} @ ${payload['entry_price']:.2f}"
+            )
+            logger.debug(f"_open_trades now: {list(self._open_trades.keys())}")
 
-            # Map order for fill correlation
             self.send("IBKRClientAgent", "place_bracket_order", {
                 "symbol": symbol,
                 "action": payload["action"],
@@ -303,33 +365,106 @@ class ExecutionAgent(BaseAgent):
                 "stop_loss": payload["stop_loss"],
                 "take_profit": payload["take_profit"],
             })
-            logger.info(f"Bracket order sent for {symbol}: {payload['action']} x{payload['quantity']}")
 
         elif msg_type == "order_filled":
-            # ── Known Gap #1 RESOLVED: Handle fill events from IBKRClientAgent ──
             fill_type = payload.get("fill_type", "entry")
             if fill_type == "entry":
                 await self._on_order_filled(payload)
             elif fill_type == "close":
-                # Standalone close (manual/market close)
+                # Standalone close (manual market order, not from bracket child)
                 await self._on_position_closed(payload)
 
         elif msg_type == "position_closed":
-            # ── Known Gap #2 RESOLVED: Handle position close from bracket child fills ──
+            # Bracket child (SL or TP) filled
             await self._on_position_closed(payload)
 
+        elif msg_type == "close_position_response":
+            symbol = payload.get("symbol")
+            success = payload.get("success", False)
+            reason = payload.get("reason", "MANUAL")
+            if not success:
+                logger.warning(
+                    f"close_position_market FAILED for {symbol} "
+                    f"(IBKR has 0 shares — already closed externally?)"
+                )
+                trade = self._open_trades.pop(symbol, None)
+                if trade:
+                    if trade.get("db_id"):
+                        await db.update_trade_exit(trade["db_id"], {
+                            "exit_price": trade.get("entry_price", 0),
+                            "pnl": 0.0,
+                            "rr_achieved": 0.0,
+                            "hold_minutes": 0.0,
+                            "exit_reason": "UNKNOWN_CLOSE",
+                            "exit_time": datetime.utcnow().isoformat(),
+                        })
+                    self.send("RiskAgent", "position_closed_notify", {"symbol": symbol})
+                    logger.info(f"Removed {symbol} from _open_trades (UNKNOWN_CLOSE)")
+                    logger.debug(f"_open_trades now: {list(self._open_trades.keys())}")
+            else:
+                logger.info(
+                    f"close_position_market sent for {symbol} — waiting for fill confirmation"
+                )
+
+        elif msg_type == "ibkr_reconnected":
+            await self._restore_positions()
+
+        elif msg_type == "account_response":
+            # Reconcile after _restore_positions() requests get_account
+            ib_positions = payload.get("open_positions", [])
+            ib_syms = {p["symbol"] for p in ib_positions}
+            tracked = set(self._open_trades.keys())
+
+            for sym in ib_syms - tracked:
+                ib_pos = next(p for p in ib_positions if p["symbol"] == sym)
+                logger.warning(
+                    f"RESTORE: {sym} open in IBKR (qty={ib_pos['quantity']}) "
+                    f"but not tracked — restoring"
+                )
+                self._open_trades[sym] = {
+                    "symbol": sym,
+                    "action": "BUY" if ib_pos["quantity"] > 0 else "SELL",
+                    "direction": "LONG" if ib_pos["quantity"] > 0 else "SHORT",
+                    "quantity": abs(ib_pos["quantity"]),
+                    "entry_price": ib_pos.get("avg_cost", 0),
+                    "stop_loss": 0,
+                    "take_profit": 0,
+                    "filled": True,
+                    "entry_time": datetime.utcnow().isoformat(),
+                    "db_id": None,
+                }
+
+            for sym in tracked - ib_syms:
+                trade = self._open_trades.get(sym, {})
+                if trade.get("filled"):
+                    logger.warning(
+                        f"RESTORE: {sym} in _open_trades but IBKR has 0 "
+                        f"— marking UNKNOWN_OFFLINE"
+                    )
+                    self._open_trades.pop(sym, None)
+                    self.send("RiskAgent", "position_closed_notify", {"symbol": sym})
+
+            if ib_syms or tracked:
+                logger.info(
+                    f"Position restore complete: "
+                    f"IBKR={list(ib_syms)}, tracked_before={list(tracked)}, "
+                    f"_open_trades_now={list(self._open_trades.keys())}"
+                )
+
         elif msg_type == "order_rejected":
-            # Clean up pending trade that was never filled
             symbol = payload.get("symbol")
             if symbol and symbol in self._open_trades:
                 trade = self._open_trades[symbol]
                 if not trade.get("filled"):
                     del self._open_trades[symbol]
                     logger.info(f"Cleaned up unfilled trade for {symbol} after rejection")
+                    logger.debug(f"_open_trades now: {list(self._open_trades.keys())}")
 
         elif msg_type == "close_position":
             symbol = payload.get("symbol")
             reason = payload.get("reason", "MANUAL")
+            if symbol in self._open_trades:
+                self._open_trades[symbol]["_closing"] = True
             await self.close_position(symbol, reason)
 
         elif msg_type == "close_all_positions":
@@ -337,7 +472,6 @@ class ExecutionAgent(BaseAgent):
             await self.close_all_positions(reason)
 
         elif msg_type == "market_close":
-            # Auto-close all positions at market close
             await self.close_all_positions("EOD")
 
         elif msg_type == "get_positions_summary":
@@ -355,7 +489,13 @@ class ExecutionAgent(BaseAgent):
                 self._open_trades[symbol]["parent_order_id"] = result.get("parent_order_id")
                 self._open_trades[symbol]["sl_order_id"] = result.get("sl_order_id")
                 self._open_trades[symbol]["tp_order_id"] = result.get("tp_order_id")
-                logger.info(f"Bracket order IDs stored for {symbol}")
+                logger.info(
+                    f"Bracket IDs stored for {symbol}: "
+                    f"parent={result.get('parent_order_id')}, "
+                    f"SL={result.get('sl_order_id')}, "
+                    f"TP={result.get('tp_order_id')}"
+                )
             elif not result:
-                logger.warning(f"Bracket order failed for {symbol}")
+                logger.warning(f"Bracket order failed for {symbol} — removing from _open_trades")
                 self._open_trades.pop(symbol, None)
+                logger.debug(f"_open_trades now: {list(self._open_trades.keys())}")

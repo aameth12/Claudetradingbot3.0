@@ -1,6 +1,7 @@
 """TelegramAgent — Telegram bot interface, commands, and proactive alerts."""
 
 import asyncio
+import html as html_lib
 import os
 import subprocess
 import sys
@@ -219,19 +220,13 @@ class TelegramAgent(BaseAgent):
             )
             output = result.stdout.strip() or result.stderr.strip()
             if result.returncode == 0:
-                if "Already up to date" in output:
-                    await update.message.reply_text(
-                        f"\u2705 Already up to date ({branch}). No changes.",
-                        parse_mode="HTML",
-                    )
-                else:
-                    await update.message.reply_text(
-                        f"\u2705 Updated ({branch})!\n<pre>{output[:1000]}</pre>\n\n"
-                        "\U0001f504 Restarting bot...",
-                        parse_mode="HTML",
-                    )
-                    # Restart the bot process
-                    os.execv(sys.executable, [sys.executable] + sys.argv)
+                await update.message.reply_text(
+                    f"\u2705 Pull complete ({branch})!\n<pre>{output[:1000]}</pre>\n\n"
+                    "\U0001f504 Restarting bot...",
+                    parse_mode="HTML",
+                )
+                # Always restart to pick up any code changes
+                os.execv(sys.executable, [sys.executable] + sys.argv)
             else:
                 await update.message.reply_text(
                     f"\u274c Update failed ({branch}):\n<pre>{output[:1000]}</pre>",
@@ -546,7 +541,7 @@ class TelegramAgent(BaseAgent):
         elif msg_type == "ibkr_disconnect_fatal":
             await self._send(
                 f"\U0001f6a8 <b>IB Gateway FATAL DISCONNECT</b>\n"
-                f"Reason: {payload.get('reason', 'Unknown')}"
+                f"Reason: {html_lib.escape(str(payload.get('reason', 'Unknown')))}"
             )
 
         elif msg_type == "goal_hit":
@@ -561,7 +556,7 @@ class TelegramAgent(BaseAgent):
         elif msg_type == "confidence_adjusted":
             old_val = payload.get("old", 0)
             new_val = payload.get("new", 0)
-            reason = payload.get("reason", "")
+            reason = html_lib.escape(str(payload.get("reason", "")))
             await self._send(
                 f"\U0001f527 <b>Confidence threshold adjusted</b>\n"
                 f"{old_val:.2f} \u2192 {new_val:.2f}\n"
@@ -599,8 +594,8 @@ class TelegramAgent(BaseAgent):
                 )
 
         elif msg_type == "order_rejected":
-            symbol = payload.get("symbol", "???")
-            reason = payload.get("reason", "Unknown")
+            symbol = html_lib.escape(str(payload.get("symbol", "???")))
+            reason = html_lib.escape(str(payload.get("reason", "Unknown")))
             await self._send(
                 f"\u274c <b>ORDER REJECTED</b>\n"
                 f"Symbol: {symbol}\n"

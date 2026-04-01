@@ -54,6 +54,7 @@ performance:
   cool_down_win_rate_threshold: 0.30
 
 logging:
-  level: "INFO"
+  level: "DEBUG"
   file: "logs/trading_bot.log"
-  rotation: "100 MB"
+  rotation: "10 MB"
+  retention: "7 days"
