@@ -1,0 +1,59 @@
+ibkr:
+  host: "127.0.0.1"
+  port: 4002            # IB Gateway: 4002=paper, 4001=live | TWS: 7497=paper, 7496=live
+  client_id: 1
+
+ollama:
+  model: "mistral"
+  timeout: 30
+
+watchlist:
+  - AAPL
+  - MSFT
+  - GOOGL
+  - AMZN
+  - TSLA
+  - NVDA
+  - META
+  - AMD
+  - SPY
+  - QQQ
+  - SMCI
+  - INTC
+  - T
+  - SOFI
+  - BAC
+  - NFLX
+  - F
+  - AAL
+  - NVO
+  - DELL
+
+strategy:
+  scan_interval_seconds: 60
+  confidence_threshold: 0.65
+  timeframes:
+    - 1m
+    - 5m
+    - 15m
+  allow_shorts: true
+  allow_longs: true
+
+risk:
+  max_daily_loss_pct: 0.10
+  max_trade_risk_pct: 0.05
+  max_stop_loss_pct: 0.05
+  min_rr_ratio: 2.0
+  max_positions: 0          # 0 = unlimited
+  max_hold_minutes: 240
+
+performance:
+  daily_pnl_target: 100.0
+  goal_escalation_pct: 0.05
+  cool_down_minutes: 120
+  cool_down_win_rate_threshold: 0.30
+
+logging:
+  level: "INFO"
+  file: "logs/trading_bot.log"
+  rotation: "100 MB"
